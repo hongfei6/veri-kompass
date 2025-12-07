@@ -89,7 +89,13 @@
 
 (defconst veri-kompass-ops-regex "[\]\[ ()|&\+-/%{}=<>]")
 
-(defconst veri-kompass-module-start-regexp "module[[:space:]\n]+\\([0-9a-z_]+\\)")
+(defconst veri-kompass-module-import-clause-regexp
+  "\\(?:[[:space:]\n]+import[[:space:]\n]+[^;]+;\\)*"
+  "Regexp matching optional SystemVerilog import clauses in a module header.")
+
+(defconst veri-kompass-module-start-regexp
+  (concat "module[[:space:]\n]+\\([0-9a-z_]+\\)"
+          veri-kompass-module-import-clause-regexp))
 
 (defconst veri-kompass-module-end-regexp "^[[:space:]]*endmodule")
 
@@ -309,7 +315,10 @@ output directories whose names match REGEXP."
     (insert-file-contents-literally file)
     (let ((mod-list))
       (while (re-search-forward
-              "^[[:space:]]*module[[:space:]\n]+\\([0-9a-z_]+\\)[[:space:]]*\n*[[:space:]]*\\((\\|#(\\|`\\|;\\)" nil t)
+              (concat "^[[:space:]]*module[[:space:]\n]+\\([0-9a-z_]+\\)"
+                      veri-kompass-module-import-clause-regexp
+                      "[[:space:]]*\n*[[:space:]]*\\((\\|#(\\|`\\|;\\)")
+              nil t)
         (push (list
                (match-string-no-properties 1)
                file

@@ -48,6 +48,9 @@
 (require 'derived)
 (require 'hashtable-print-readable)
 
+(eval-when-compile
+  (require 'ert nil t))
+
 (defgroup veri-kompass nil
   "Customization options for veri-kompass."
   :prefix "veri-kompass"
@@ -81,6 +84,9 @@
   "This hash contains module structure hashed per module name.")
 
 (defconst veri-kompass-bar-name "*veri-kompass-bar*")
+
+(defconst veri-kompass-load-select-buffer-name "*veri-kompass-load-select*"
+  "Buffer displaying the list of loads when multiple entries exist.")
 
 (defconst veri-kompass-ignore-keywords '("if" "task" "assert" "disable" "define" "posedge"
                                          "negedge" "int" "for" "logic" "wire" "reg"))
@@ -245,6 +251,146 @@ INTERNAL if the search is limited to the current module."
                 loads)))
       loads)))
 
+(defvar-local veri-kompass-load-select--origin-window nil
+  "Window that displayed the source buffer when load selection started.")
+
+(defun veri-kompass-load-select--current-marker ()
+  "Return the marker stored on the current line, if any."
+  (get-text-property (line-beginning-position)
+                     'veri-kompass-load-marker))
+
+(defun veri-kompass-load-select--first-candidate-pos ()
+  "Return buffer position of the first selectable load line."
+  (save-excursion
+    (goto-char (point-min))
+    (while (and (not (eobp))
+                (not (veri-kompass-load-select--current-marker)))
+      (forward-line 1))
+    (when (veri-kompass-load-select--current-marker)
+      (line-beginning-position))))
+
+(defun veri-kompass-load-select--find-next (direction)
+  "Find the next selectable line following DIRECTION.
+DIRECTION should be positive to move down or negative to move up."
+  (let ((step (if (> direction 0) 1 -1))
+        (target nil)
+        (continue t))
+    (save-excursion
+      (while (and continue (= (forward-line step) 0))
+        (when (veri-kompass-load-select--current-marker)
+          (setq target (line-beginning-position))
+          (setq continue nil)))
+      target)))
+
+(defun veri-kompass-load-select--preview-marker (marker)
+  "Preview MARKER in the original verilog window."
+  (when (and (markerp marker)
+             (buffer-live-p (marker-buffer marker)))
+    (let* ((buffer (marker-buffer marker))
+           (window veri-kompass-load-select--origin-window)
+           (target-window (cond
+                           ((and (window-live-p window)
+                                 (eq (window-buffer window) buffer))
+                            window)
+                           ((window-live-p window)
+                            (with-selected-window window
+                              (switch-to-buffer buffer))
+                            window)
+                           (t
+                            (display-buffer buffer)))))
+      (when (window-live-p target-window)
+        (setq veri-kompass-load-select--origin-window target-window)
+        (with-selected-window target-window
+          (goto-char marker)
+          (recenter))
+        target-window))))
+
+(defun veri-kompass-load-select--preview-at-point ()
+  "Preview the load that corresponds to the current line."
+  (veri-kompass-load-select--preview-marker
+   (veri-kompass-load-select--current-marker)))
+
+(defun veri-kompass-load-select--move (direction)
+  "Move selection following DIRECTION and preview the result."
+  (let ((target (veri-kompass-load-select--find-next direction)))
+    (if target
+        (progn
+          (goto-char target)
+          (veri-kompass-load-select--preview-at-point))
+      (message (if (> direction 0)
+                   "Already at last load."
+                 "Already at first load.")))))
+
+(defun veri-kompass-load-select-next ()
+  "Move to the next load entry and preview it."
+  (interactive)
+  (veri-kompass-load-select--move 1))
+
+(defun veri-kompass-load-select-previous ()
+  "Move to the previous load entry and preview it."
+  (interactive)
+  (veri-kompass-load-select--move -1))
+
+(defun veri-kompass-load-select-commit ()
+  "Jump to the load under point and close the selection buffer."
+  (interactive)
+  (let ((marker (veri-kompass-load-select--current-marker))
+        (window nil))
+    (if (not (and (markerp marker)
+                  (buffer-live-p (marker-buffer marker))))
+        (message "No load at current line.")
+      (setq window (veri-kompass-load-select--preview-marker marker))
+      (quit-window t)
+      (when (window-live-p window)
+        (select-window window)))))
+
+(defun veri-kompass-load-select-quit ()
+  "Quit the load selection window."
+  (interactive)
+  (let ((window veri-kompass-load-select--origin-window))
+    (quit-window t)
+    (when (window-live-p window)
+      (select-window window))))
+
+(defvar veri-kompass-load-select-mode-map
+  (let ((map (make-sparse-keymap)))
+    (define-key map (kbd "C-j") #'veri-kompass-load-select-next)
+    (define-key map (kbd "C-k") #'veri-kompass-load-select-previous)
+    (define-key map (kbd "RET") #'veri-kompass-load-select-commit)
+    (define-key map (kbd "q") #'veri-kompass-load-select-quit)
+    map)
+  "Keymap for `veri-kompass-load-select-mode'.")
+
+(define-derived-mode veri-kompass-load-select-mode special-mode "Veri-Load"
+  "Mode for displaying load lines so they can be navigated."
+  (setq truncate-lines t)
+  (hl-line-mode 1))
+
+(defun veri-kompass--show-load-selection (candidates)
+  "Show CANDIDATES in the load selection buffer."
+  (let* ((origin-window (selected-window))
+         (buffer (get-buffer-create veri-kompass-load-select-buffer-name))
+         (origin-buffer (window-buffer origin-window)))
+    (with-current-buffer buffer
+      (veri-kompass-load-select-mode)
+      (setq veri-kompass-load-select--origin-window origin-window)
+      (let ((inhibit-read-only t))
+        (erase-buffer)
+        (insert "Select load line (C-j/C-k to preview, RET to jump, q to quit).\n\n")
+        (dolist (cand candidates)
+          (let* ((line-start (point))
+                 (marker (with-current-buffer origin-buffer
+                           (copy-marker (cdr cand)))))
+            (insert (car cand) "\n")
+            (put-text-property line-start (1- (point))
+                               'veri-kompass-load-marker marker))))
+      (let ((first (veri-kompass-load-select--first-candidate-pos)))
+        (when first
+          (goto-char first))))
+    (pop-to-buffer buffer '(display-buffer-pop-up-window))
+    (with-current-buffer buffer
+      (veri-kompass-load-select--preview-at-point))))
+
 (defun veri-kompass-search-load-at-point ()
   "Goto the loads for symbol at point."
   (interactive)
@@ -253,10 +399,7 @@ INTERNAL if the search is limited to the current module."
      (when res
        (if (equal (length res) 1)
            (goto-char (cdar res))
-         (goto-char
-	  (veri-kompass-completing-read "select load line: "
-					res
-					"*veri-kompass-load-select*")))))))
+         (veri-kompass--show-load-selection res))))))
 
 (defun veri-kompass-follow-from-point ()
   "Follow symbol at point.
@@ -692,6 +835,25 @@ The decendent parsing will start from module TOP-NAME."
   org-mode
   "Veri-Kompass"
   "Generate and handle verilog project hierarchy.")
+
+(when (featurep 'ert)
+  (ert-deftest veri-kompass-test-load-select-preview ()
+    "Ensure moving across load entries previews the source location."
+    (with-temp-buffer
+      (insert "assign foo = bar;\nassign baz = foo;\n")
+      (goto-char (point-min))
+      (let ((marker (copy-marker (line-beginning-position 2))))
+        (save-window-excursion
+          (delete-other-windows)
+          (let* ((origin-window (selected-window))
+                 (select-buffer (get-buffer-create "*veri-kompass-test*")))
+            (set-window-buffer origin-window (current-buffer))
+            (with-current-buffer select-buffer
+              (setq veri-kompass-load-select--origin-window origin-window)
+              (goto-char (point-min))
+              (should (veri-kompass-load-select--preview-marker marker)))
+            (should (= (window-point origin-window) marker))
+            (kill-buffer select-buffer)))))))
 
 (provide 'veri-kompass)
 

@@ -5,6 +5,7 @@
 
 GNU Emacs extension that parse a Verilog design and provide some navigation facilities like hierarchy bar and wire following capabilities.
 veri-kompass parse has a built-in parser, because of that does not depends on external software.
+You can point it at either a project directory or at a Verilog filelist file.
 
 [![asciicast](https://asciinema.org/a/191880.png)](https://asciinema.org/a/191880)
 
@@ -24,7 +25,7 @@ Add into your .emacs
 To start using veri-kompass:
 
 - M-x veri-kompass
-- Provide your folder directory
+- Provide your folder directory or a Verilog filelist (for example `dut.f`)
 - Select your top module
 
 Once in the hieracky bar select modules with RET to mark and visit them

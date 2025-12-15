@@ -37,6 +37,7 @@
 (require 'pcase)
 (require 'sort)
 (require 'cl-extra)
+(require 'subr-x)
 (require 'files)
 (require 'format)
 (require 'whitespace)
@@ -441,16 +442,51 @@ output directories whose names match REGEXP."
             (push (expand-file-name file dir) files)))))
     (nconc result (nreverse files))))
 
+(defun veri-kompass--valid-source-file-p (file)
+  "Return non-nil when FILE should be considered part of the project."
+  (and (string-match-p veri-kompass-extention-regexp file)
+       (not (string-match-p "/\\." file))
+       (not (string-match-p veri-kompass-skip-regexp file))))
+
 (defun veri-kompass-list-file-in-proj (dir)
   "Return a list of all project files present in DIR ver.excluding the one specified by ‘veri-kompass-skip-regexp’."
   (remove nil
           (mapcar (lambda (x)
-                    (if (or (string-match "/\\." x)
-                            (string-match veri-kompass-skip-regexp x))
-                        nil
-                      x))
+                    (if (veri-kompass--valid-source-file-p x) x))
                   (veri-kompass-directory-files-recursively-with-symlink
                    dir veri-kompass-extention-regexp))))
+
+(defun veri-kompass--files-from-filelist (filelist)
+  "Return a list of source files defined in FILELIST."
+  (let ((base (file-name-directory (expand-file-name filelist)))
+        (result nil))
+    (with-temp-buffer
+      (insert-file-contents filelist)
+      (while (not (eobp))
+        (let* ((line (buffer-substring-no-properties
+                      (line-beginning-position) (line-end-position)))
+               (clean (string-trim line)))
+          (unless (or (string-empty-p clean)
+                      (string-prefix-p "#" clean)
+                      (string-prefix-p "//" clean))
+            (let ((candidate (expand-file-name clean base)))
+              (when (and (file-exists-p candidate)
+                         (veri-kompass--valid-source-file-p candidate))
+                (push candidate result)))))
+        (forward-line 1)))
+    (delete-dups (nreverse result))))
+
+(defun veri-kompass--project-files-from (source)
+  "Return all source files described by SOURCE.
+SOURCE can be a directory or a file list."
+  (let ((expanded (expand-file-name source)))
+    (cond
+     ((file-directory-p expanded)
+      (veri-kompass-list-file-in-proj expanded))
+     ((file-regular-p expanded)
+      (veri-kompass--files-from-filelist expanded))
+     (t
+      (error "Path %s is neither a directory nor a readable file" source)))))
 
 (defun veri-kompass-list-modules-in-file (file)
   "Return the list of all declared modules present in FILE."
@@ -786,16 +822,18 @@ If JUMP is not nil follow link too."
       res)))
 
 ;;;###autoload
-(defun veri-kompass (dir &optional top-name)
+(defun veri-kompass (source &optional top-name)
   "Enable Veri-Kompass.
 Veri-Kompass is a verilog codebase navigation facility.
-The codebase to be parsed will be in directory DIR.
+The codebase to be parsed will be provided by SOURCE, which can be either
+a directory or a Verilog filelist.
 The decendent parsing will start from module TOP-NAME."
-  (interactive "D")
+  (interactive
+   (list (read-file-name "Directory or filelist: " nil nil t)))
   (setq veri-kompass-mod-str-hash (make-hash-table :test 'equal))
   (setq veri-kompass-module-list
         (veri-kompass-list-modules-in-proj
-         (veri-kompass-list-file-in-proj dir)))
+         (veri-kompass--project-files-from source)))
   (unless top-name
     (setq top-name
 	  (veri-kompass-completing-read "specify top module: "
@@ -837,6 +875,31 @@ The decendent parsing will start from module TOP-NAME."
   "Generate and handle verilog project hierarchy.")
 
 (when (featurep 'ert)
+  (ert-deftest veri-kompass-test-filelist-parsing ()
+    "Ensure filelists are parsed as absolute filtered paths."
+    (let ((tmp-dir (make-temp-file "veri-kompass-test" t)))
+      (unwind-protect
+          (let* ((foo (expand-file-name "foo.sv" tmp-dir))
+                 (bar (expand-file-name "sub/bar.v" tmp-dir))
+                 (skip (expand-file-name "skipme.v" tmp-dir))
+                 (filelist (expand-file-name "dut.f" tmp-dir))
+                 (veri-kompass-skip-regexp "skipme"))
+            (make-directory (file-name-directory bar) t)
+            (dolist (path (list foo bar skip))
+              (with-temp-file path
+                (insert "// test file\n")))
+            (with-temp-file filelist
+              (insert "# comment line\n")
+              (insert (file-relative-name foo tmp-dir) "\n")
+              (insert (file-relative-name bar tmp-dir) "\n")
+              (insert "// another comment\n")
+              (insert (file-relative-name foo tmp-dir) "\n")
+              (insert (file-relative-name skip tmp-dir) "\n")
+              (insert "missing.v\n"))
+            (should (equal (veri-kompass--files-from-filelist filelist)
+                           (list foo bar))))
+        (when (file-directory-p tmp-dir)
+          (delete-directory tmp-dir t)))))
   (ert-deftest veri-kompass-test-load-select-preview ()
     "Ensure moving across load entries previews the source location."
     (with-temp-buffer

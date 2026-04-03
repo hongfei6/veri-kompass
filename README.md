@@ -17,8 +17,6 @@ Add into your .emacs
 
 (add-to-list 'load-path "path-to-veri-kompass-here")
 (require 'veri-kompass)
-;; Enable veri kompass minor mode mode
-(add-hook 'verilog-mode-hook 'veri-kompass-minor-mode)
 
 ## Usage
 
@@ -34,3 +32,6 @@ In verilog sources follow signals as follow:
 
 - C-c d to search for the drivers of the symbol at point
 - C-c l to search for the loads of the symbol at point
+
+After `M-x veri-kompass`, project Verilog buffers enable `veri-kompass-minor-mode`
+automatically, so these shortcuts are available without adding a manual hook.

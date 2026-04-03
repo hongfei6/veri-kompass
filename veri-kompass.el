@@ -37,6 +37,7 @@
 (require 'pcase)
 (require 'sort)
 (require 'cl-extra)
+(require 'seq)
 (require 'subr-x)
 (require 'files)
 (require 'format)
@@ -72,6 +73,11 @@
   :type 'string
   :group 'veri-kompass)
 
+(defcustom veri-kompass-predefined-macros nil
+  "List of predefined macro names enabled before parsing starts."
+  :type '(repeat string)
+  :group 'veri-kompass)
+
 (defface veri-kompass-inst-marked-face
   '((t :foreground "red1"))
   "Face for marking instance selected."
@@ -83,6 +89,25 @@
 
 (defvar veri-kompass-mod-str-hash nil
   "This hash contains module structure hashed per module name.")
+
+(defvar veri-kompass-project-files nil
+  "Ordered list of top-level project files used for the current parse.")
+
+(defvar veri-kompass-auto-enable-minor-mode t
+  "When non-nil, enable `veri-kompass-minor-mode' for project buffers after startup.")
+
+(defvar veri-kompass-source-kind nil
+  "Kind of source used for the current parse.
+The value is either `directory' or `filelist'.")
+
+(defvar veri-kompass-include-dirs nil
+  "Include directories used to resolve `include directives.")
+
+(defvar veri-kompass-preprocessed-file-cache nil
+  "Cache mapping file names to preprocessed file contents.")
+
+(defvar veri-kompass-file-macro-env-cache nil
+  "Cache mapping file names to macro environments active before each file.")
 
 (defconst veri-kompass-bar-name "*veri-kompass-bar*")
 
@@ -101,7 +126,7 @@
   "Regexp matching optional SystemVerilog import clauses in a module header.")
 
 (defconst veri-kompass-module-start-regexp
-  (concat "module[[:space:]\n]+\\([0-9a-z_]+\\)"
+  (concat "module[[:space:]\n]+\\([0-9A-Za-z_$]+\\)"
           veri-kompass-module-import-clause-regexp))
 
 (defconst veri-kompass-module-end-regexp "^[[:space:]]*endmodule")
@@ -118,6 +143,10 @@
 (cl-defstruct (veri-kompass-mod-inst (:copier nil))
   "Holds a module instantiations."
   inst-name mod-name file-name line)
+
+(cl-defstruct (veri-kompass-pp-result (:copier nil))
+  "Holds the result of preprocessing a file."
+  content env)
 
 (defmacro veri-kompass-within-current-module (&rest code)
   "Execute code CODE narrowing into the current module definition."
@@ -448,6 +477,211 @@ output directories whose names match REGEXP."
        (not (string-match-p "/\\." file))
        (not (string-match-p veri-kompass-skip-regexp file))))
 
+(defun veri-kompass--copy-macro-env (env)
+  "Return a copy of macro environment ENV."
+  (let ((copy (make-hash-table :test 'equal)))
+    (when env
+      (maphash (lambda (key value)
+                 (puthash key value copy))
+               env))
+    copy))
+
+(defun veri-kompass--initial-macro-env ()
+  "Return a fresh macro environment seeded with predefined macros."
+  (let ((env (make-hash-table :test 'equal)))
+    (dolist (macro veri-kompass-predefined-macros)
+      (puthash macro t env))
+    env))
+
+(defun veri-kompass--current-branch-active-p (cond-stack)
+  "Return non-nil when COND-STACK marks the current branch as active."
+  (if cond-stack
+      (plist-get (car cond-stack) :active)
+    t))
+
+(defun veri-kompass--pp-directive-line (line)
+  "Return LINE stripped of comments for directive parsing."
+  (string-trim (replace-regexp-in-string "//.*\\'" "" line)))
+
+(defun veri-kompass--pp-push-branch (cond-stack parent-active condition)
+  "Push a conditional branch onto COND-STACK.
+PARENT-ACTIVE is the active state of the parent branch.
+CONDITION is the result of the branch condition."
+  (cons (list :parent-active parent-active
+              :branch-taken (and parent-active condition)
+              :active (and parent-active condition))
+        cond-stack))
+
+(defun veri-kompass--pp-handle-elsif (cond-stack condition)
+  "Update COND-STACK for an `elsif using CONDITION."
+  (if (null cond-stack)
+      cond-stack
+    (let* ((frame (car cond-stack))
+           (parent-active (plist-get frame :parent-active))
+           (branch-taken (plist-get frame :branch-taken))
+           (active (and parent-active (not branch-taken) condition)))
+      (setcar cond-stack
+              (list :parent-active parent-active
+                    :branch-taken (or branch-taken active)
+                    :active active))
+      cond-stack)))
+
+(defun veri-kompass--pp-handle-else (cond-stack)
+  "Update COND-STACK for an `else."
+  (if (null cond-stack)
+      cond-stack
+    (let* ((frame (car cond-stack))
+           (parent-active (plist-get frame :parent-active))
+           (branch-taken (plist-get frame :branch-taken))
+           (active (and parent-active (not branch-taken))))
+      (setcar cond-stack
+              (list :parent-active parent-active
+                    :branch-taken (or branch-taken active)
+                    :active active))
+      cond-stack)))
+
+(defun veri-kompass--include-file-name (line file)
+  "Extract included file name from LINE relative to FILE."
+  (when (string-match
+         "^[[:space:]]*`include[[:space:]]+[\"<]\\([^\">]+\\)[\">]"
+         line)
+    (let* ((name (match-string 1 line))
+           (search-dirs (cons (file-name-directory file)
+                              veri-kompass-include-dirs))
+           (resolved nil))
+      (while (and search-dirs (not resolved))
+        (let ((candidate (expand-file-name name (car search-dirs))))
+          (when (file-exists-p candidate)
+            (setq resolved candidate)))
+        (setq search-dirs (cdr search-dirs)))
+      resolved)))
+
+(defun veri-kompass--insert-with-source (text file line)
+  "Return TEXT tagged with source FILE and LINE properties."
+  (let ((copy (copy-sequence text)))
+    (add-text-properties 0 (length copy)
+                         (list 'veri-kompass-source-file file
+                               'veri-kompass-source-line line)
+                         copy)
+    copy))
+
+(defun veri-kompass--preprocess-file (file env &optional include-stack)
+  "Preprocess FILE using macro ENV.
+INCLUDE-STACK tracks nested includes to prevent recursion loops.
+Return a `veri-kompass-pp-result'."
+  (let ((stack (or include-stack (list file))))
+    (if (member file (cdr stack))
+        (make-veri-kompass-pp-result
+         :content ""
+         :env env)
+      (with-temp-buffer
+        (insert-file-contents-literally file)
+        (let ((out nil)
+              (cond-stack nil))
+          (goto-char (point-min))
+          (while (not (eobp))
+            (let* ((line-num (line-number-at-pos))
+                   (line (buffer-substring-no-properties
+                          (line-beginning-position) (line-end-position)))
+                   (directive-line (veri-kompass--pp-directive-line line))
+                   (active (veri-kompass--current-branch-active-p cond-stack)))
+              (cond
+               ((string-match "^[[:space:]]*`ifdef[[:space:]]+\\([0-9A-Za-z_$]+\\)" directive-line)
+                (setq cond-stack
+                      (veri-kompass--pp-push-branch
+                       cond-stack
+                       active
+                       (gethash (match-string 1 directive-line) env))))
+               ((string-match "^[[:space:]]*`ifndef[[:space:]]+\\([0-9A-Za-z_$]+\\)" directive-line)
+                (setq cond-stack
+                      (veri-kompass--pp-push-branch
+                       cond-stack
+                       active
+                       (not (gethash (match-string 1 directive-line) env)))))
+               ((string-match "^[[:space:]]*`elsif[[:space:]]+\\([0-9A-Za-z_$]+\\)" directive-line)
+                (setq cond-stack
+                      (veri-kompass--pp-handle-elsif
+                       cond-stack
+                       (gethash (match-string 1 directive-line) env))))
+               ((string-match "^[[:space:]]*`else\\([[:space:]]*//.*\\)?\\'" directive-line)
+                (setq cond-stack (veri-kompass--pp-handle-else cond-stack)))
+               ((string-match "^[[:space:]]*`endif\\([[:space:]]*//.*\\)?\\'" directive-line)
+               (when cond-stack
+                  (setq cond-stack (cdr cond-stack))))
+               ((and active
+                     (string-match "^[[:space:]]*`define[[:space:]]+\\([0-9A-Za-z_$]+\\)" directive-line))
+                (puthash (match-string 1 directive-line) t env))
+               ((and active
+                     (string-match "^[[:space:]]*`undef\\(ine\\)?[[:space:]]+\\([0-9A-Za-z_$]+\\)" directive-line))
+                (remhash (match-string 2 directive-line) env))
+               ((and active
+                     (veri-kompass--include-file-name directive-line file))
+                (let* ((include-file (veri-kompass--include-file-name directive-line file))
+                       (result (veri-kompass--preprocess-file
+                                include-file
+                                env
+                                (cons include-file stack))))
+                  (push (veri-kompass-pp-result-content result) out)
+                  (setq env (veri-kompass-pp-result-env result))))
+               (active
+                (push (veri-kompass--insert-with-source
+                       (concat line "\n")
+                       file
+                       line-num)
+                      out))))
+            (forward-line 1))
+          (make-veri-kompass-pp-result
+           :content (apply #'concat (nreverse out))
+           :env env))))))
+
+(defun veri-kompass--source-files-from (source)
+  "Return a pair (KIND . FILES) describing SOURCE."
+  (let ((expanded (expand-file-name source)))
+    (cond
+     ((file-directory-p expanded)
+      (setq veri-kompass-include-dirs (list expanded))
+      (cons 'directory
+            (veri-kompass-list-file-in-proj expanded)))
+     ((file-regular-p expanded)
+      (cons 'filelist
+            (veri-kompass--files-from-filelist expanded)))
+     (t
+      (error "Path %s is neither a directory nor a readable file" source)))))
+
+(defun veri-kompass--setup-preprocessor-context (files)
+  "Initialize preprocessing caches for ordered top-level FILES."
+  (setq veri-kompass-preprocessed-file-cache (make-hash-table :test 'equal))
+  (setq veri-kompass-file-macro-env-cache (make-hash-table :test 'equal))
+  (let ((env (veri-kompass--initial-macro-env)))
+    (dolist (file files)
+      (puthash file
+               (veri-kompass--copy-macro-env env)
+               veri-kompass-file-macro-env-cache)
+      (when (eq veri-kompass-source-kind 'filelist)
+        (setq env
+              (veri-kompass-pp-result-env
+               (veri-kompass--preprocess-file
+                file
+                (veri-kompass--copy-macro-env env))))))))
+
+(defun veri-kompass--macro-env-before-file (file)
+  "Return the macro environment active before FILE starts."
+  (if (eq veri-kompass-source-kind 'filelist)
+      (veri-kompass--copy-macro-env
+       (or (gethash file veri-kompass-file-macro-env-cache)
+           (veri-kompass--initial-macro-env)))
+    (veri-kompass--initial-macro-env)))
+
+(defun veri-kompass--preprocessed-file-content (file)
+  "Return cached preprocessed content for FILE."
+  (or (gethash file veri-kompass-preprocessed-file-cache)
+      (let* ((result (veri-kompass--preprocess-file
+                      file
+                      (veri-kompass--macro-env-before-file file)))
+             (content (veri-kompass-pp-result-content result)))
+        (puthash file content veri-kompass-preprocessed-file-cache)
+        content)))
+
 (defun veri-kompass-list-file-in-proj (dir)
   "Return a list of all project files present in DIR ver.excluding the one specified by ‘veri-kompass-skip-regexp’."
   (remove nil
@@ -460,49 +694,54 @@ output directories whose names match REGEXP."
   "Return a list of source files defined in FILELIST."
   (let ((base (file-name-directory (expand-file-name filelist)))
         (result nil))
+    (setq veri-kompass-include-dirs nil)
     (with-temp-buffer
       (insert-file-contents filelist)
       (while (not (eobp))
         (let* ((line (buffer-substring-no-properties
                       (line-beginning-position) (line-end-position)))
                (clean (string-trim line)))
-          (unless (or (string-empty-p clean)
-                      (string-prefix-p "#" clean)
-                      (string-prefix-p "//" clean))
+          (cond
+           ((or (string-empty-p clean)
+                (string-prefix-p "#" clean)
+                (string-prefix-p "//" clean)))
+           ((string-match "^\\+incdir\\+\\(.+\\)$" clean)
+            (dolist (dir (split-string (match-string 1 clean) "+" t))
+              (push (expand-file-name dir base) veri-kompass-include-dirs)))
+           ((string-match "^-I\\(.+\\)$" clean)
+            (push (expand-file-name (match-string 1 clean) base)
+                  veri-kompass-include-dirs))
+           ((string-match "^-I[[:space:]]+\\(.+\\)$" clean)
+            (push (expand-file-name (match-string 1 clean) base)
+                  veri-kompass-include-dirs))
+           (t
             (let ((candidate (expand-file-name clean base)))
               (when (and (file-exists-p candidate)
                          (veri-kompass--valid-source-file-p candidate))
-                (push candidate result)))))
+                (push candidate result))))))
         (forward-line 1)))
+    (setq veri-kompass-include-dirs
+          (delete-dups (nreverse veri-kompass-include-dirs)))
     (delete-dups (nreverse result))))
-
-(defun veri-kompass--project-files-from (source)
-  "Return all source files described by SOURCE.
-SOURCE can be a directory or a file list."
-  (let ((expanded (expand-file-name source)))
-    (cond
-     ((file-directory-p expanded)
-      (veri-kompass-list-file-in-proj expanded))
-     ((file-regular-p expanded)
-      (veri-kompass--files-from-filelist expanded))
-     (t
-      (error "Path %s is neither a directory nor a readable file" source)))))
 
 (defun veri-kompass-list-modules-in-file (file)
   "Return the list of all declared modules present in FILE."
   (with-temp-buffer
-    (insert-file-contents-literally file)
+    (insert (veri-kompass--preprocessed-file-content file))
+    (goto-char (point-min))
     (let ((mod-list))
       (while (re-search-forward
-              (concat "^[[:space:]]*module[[:space:]\n]+\\([0-9a-z_]+\\)"
+              (concat "^[[:space:]]*module[[:space:]\n]+\\([0-9A-Za-z_$]+\\)"
                       veri-kompass-module-import-clause-regexp
                       "[[:space:]]*\n*[[:space:]]*\\((\\|#(\\|`\\|;\\)")
               nil t)
         (push (list
                (match-string-no-properties 1)
-               file
+               (or (get-text-property (match-beginning 0) 'veri-kompass-source-file)
+                   file)
                (point)
-               (line-number-at-pos (point))
+               (or (get-text-property (match-beginning 0) 'veri-kompass-source-line)
+                   (line-number-at-pos (point)))
                (match-string-no-properties 0))
               mod-list))
       mod-list)))
@@ -596,12 +835,10 @@ This recursive function call itself walking all the verilog design."
     (puthash
      mod-name
      (let ((target (veri-kompass-mod-to-file-name-pos mod-name))
-           (struct)
-           (orig-buff))
+           (struct))
        (if target
            (with-temp-buffer
-             (insert-file-contents-literally (car target))
-             (setq orig-buff (buffer-string))
+             (insert (veri-kompass--preprocessed-file-content (car target)))
              (goto-char (cadr target))
              (set-mark (point))
              (re-search-forward veri-kompass-module-end-regexp nil t)
@@ -632,10 +869,15 @@ This recursive function call itself walking all the verilog design."
                    (push (make-veri-kompass-mod-inst
                           :mod-name (match-string-no-properties 1)
                           :inst-name (match-string-no-properties 2)
-                          :file-name (car target)
-                          :line (veri-kompass-retrive-original-line (match-string 1)
-                                                                    (match-string 2)
-                                                                    orig-buff)) struct)
+                          :file-name (or (get-text-property
+                                          (match-beginning 0)
+                                          'veri-kompass-source-file)
+                                         (car target))
+                          :line (or (get-text-property
+                                     (match-beginning 0)
+                                     'veri-kompass-source-line)
+                                    (line-number-at-pos (match-beginning 0))))
+                         struct)
                    (let ((sub-hier
                           (veri-kompass-build-hier-rec
                            (match-string-no-properties 1))))
@@ -821,6 +1063,26 @@ If JUMP is not nil follow link too."
               t)))
       res)))
 
+(defun veri-kompass--project-buffer-p (&optional buffer)
+  "Return non-nil when BUFFER visits a file indexed by veri-kompass."
+  (let ((file-name (buffer-file-name buffer)))
+    (and file-name
+         veri-kompass-project-files
+         (member (expand-file-name file-name) veri-kompass-project-files))))
+
+(defun veri-kompass--maybe-enable-minor-mode ()
+  "Enable `veri-kompass-minor-mode' in the current project buffer."
+  (when (and veri-kompass-auto-enable-minor-mode
+             (derived-mode-p 'verilog-mode)
+             (veri-kompass--project-buffer-p))
+    (veri-kompass-minor-mode 1)))
+
+(defun veri-kompass--enable-minor-mode-for-project-buffers ()
+  "Enable `veri-kompass-minor-mode' for currently open project buffers."
+  (dolist (buffer (buffer-list))
+    (with-current-buffer buffer
+      (veri-kompass--maybe-enable-minor-mode))))
+
 ;;;###autoload
 (defun veri-kompass (source &optional top-name)
   "Enable Veri-Kompass.
@@ -830,10 +1092,17 @@ a directory or a Verilog filelist.
 The decendent parsing will start from module TOP-NAME."
   (interactive
    (list (read-file-name "Directory or filelist: " nil nil t)))
+  (let* ((source-info (veri-kompass--source-files-from source))
+         (source-kind (car source-info))
+         (files (cdr source-info)))
+    (setq veri-kompass-source-kind source-kind)
+    (setq veri-kompass-project-files files)
+    (veri-kompass--setup-preprocessor-context files)
+    (veri-kompass--enable-minor-mode-for-project-buffers)
   (setq veri-kompass-mod-str-hash (make-hash-table :test 'equal))
   (setq veri-kompass-module-list
         (veri-kompass-list-modules-in-proj
-         (veri-kompass--project-files-from source)))
+         files))
   (unless top-name
     (setq top-name
 	  (veri-kompass-completing-read "specify top module: "
@@ -843,7 +1112,7 @@ The decendent parsing will start from module TOP-NAME."
 					"*veri-kompass-module-top-select*")))
   (message "Parsing design...")
   (veri-kompass-make-thread (lambda ()
-                              (veri-kompass-compute-and-create-bar top-name))))
+                              (veri-kompass-compute-and-create-bar top-name)))))
 
 (define-minor-mode veri-kompass-minor-mode
   "Minor mode to be used into verilog files."
@@ -852,6 +1121,8 @@ The decendent parsing will start from module TOP-NAME."
             (define-key map (kbd "C-c d") 'veri-kompass-search-driver-at-point)
             (define-key map (kbd "C-c l") 'veri-kompass-search-load-at-point)
             map))
+
+(add-hook 'verilog-mode-hook #'veri-kompass--maybe-enable-minor-mode)
 
 (defvar veri-kompass-mode-map nil "Keymap for `veri-kompass-mode'.")
 
@@ -875,48 +1146,96 @@ The decendent parsing will start from module TOP-NAME."
   "Generate and handle verilog project hierarchy.")
 
 (when (featurep 'ert)
+  (defun veri-kompass-test--instance-names (hier)
+    "Return flat instance names extracted from HIER."
+    (mapcar #'veri-kompass-mod-inst-inst-name
+            (seq-filter #'veri-kompass-mod-inst-p (cadr hier))))
+
+  (defun veri-kompass-test--build-hier-from-files (top-name files source-kind)
+    "Build hierarchy for TOP-NAME from FILES using SOURCE-KIND."
+    (let ((veri-kompass-source-kind source-kind)
+          (veri-kompass-project-files files)
+          (veri-kompass-mod-str-hash (make-hash-table :test 'equal)))
+      (veri-kompass--setup-preprocessor-context veri-kompass-project-files)
+      (setq veri-kompass-module-list
+            (veri-kompass-list-modules-in-proj veri-kompass-project-files))
+      (veri-kompass-build-hier top-name)))
+
   (ert-deftest veri-kompass-test-filelist-parsing ()
     "Ensure filelists are parsed as absolute filtered paths."
     (let ((tmp-dir (make-temp-file "veri-kompass-test" t)))
       (unwind-protect
           (let* ((foo (expand-file-name "foo.sv" tmp-dir))
                  (bar (expand-file-name "sub/bar.v" tmp-dir))
+                 (inc (expand-file-name "inc" tmp-dir))
                  (skip (expand-file-name "skipme.v" tmp-dir))
                  (filelist (expand-file-name "dut.f" tmp-dir))
                  (veri-kompass-skip-regexp "skipme"))
             (make-directory (file-name-directory bar) t)
+            (make-directory inc t)
             (dolist (path (list foo bar skip))
               (with-temp-file path
                 (insert "// test file\n")))
             (with-temp-file filelist
               (insert "# comment line\n")
+              (insert "+incdir+" (file-relative-name inc tmp-dir) "\n")
               (insert (file-relative-name foo tmp-dir) "\n")
               (insert (file-relative-name bar tmp-dir) "\n")
-              (insert "// another comment\n")
-              (insert (file-relative-name foo tmp-dir) "\n")
-              (insert (file-relative-name skip tmp-dir) "\n")
-              (insert "missing.v\n"))
+              (insert (file-relative-name skip tmp-dir) "\n"))
             (should (equal (veri-kompass--files-from-filelist filelist)
-                           (list foo bar))))
+                           (list foo bar)))
+            (should (equal veri-kompass-include-dirs
+                           (list inc))))
         (when (file-directory-p tmp-dir)
           (delete-directory tmp-dir t)))))
-  (ert-deftest veri-kompass-test-load-select-preview ()
-    "Ensure moving across load entries previews the source location."
-    (with-temp-buffer
-      (insert "assign foo = bar;\nassign baz = foo;\n")
-      (goto-char (point-min))
-      (let ((marker (copy-marker (line-beginning-position 2))))
-        (save-window-excursion
-          (delete-other-windows)
-          (let* ((origin-window (selected-window))
-                 (select-buffer (get-buffer-create "*veri-kompass-test*")))
-            (set-window-buffer origin-window (current-buffer))
-            (with-current-buffer select-buffer
-              (setq veri-kompass-load-select--origin-window origin-window)
-              (goto-char (point-min))
-              (should (veri-kompass-load-select--preview-marker marker)))
-            (should (= (window-point origin-window) marker))
-            (kill-buffer select-buffer)))))))
+
+  (ert-deftest veri-kompass-test-preprocess-ifdef-in-file ()
+    "Ensure inactive conditional branches are filtered from hierarchy."
+    (let ((tmp-dir (make-temp-file "veri-kompass-test" t)))
+      (unwind-protect
+          (let* ((top (expand-file-name "top.sv" tmp-dir))
+                 (child (expand-file-name "child.sv" tmp-dir))
+                 (veri-kompass-predefined-macros '("USE_SVT"))
+                 (veri-kompass-source-kind 'directory)
+                 (veri-kompass-include-dirs (list tmp-dir))
+                 (veri-kompass-project-files (list top child)))
+            (with-temp-file top
+              (insert "module top;\n")
+              (insert "`ifdef USE_SVT\n")
+              (insert "child chosen();\n")
+              (insert "`else\n")
+              (insert "child filtered();\n")
+              (insert "`endif\n")
+              (insert "endmodule\n"))
+            (with-temp-file child
+              (insert "module child;\nendmodule\n"))
+            (should
+             (equal
+              (veri-kompass-test--instance-names
+               (veri-kompass-test--build-hier-from-files
+                "top"
+                veri-kompass-project-files
+                veri-kompass-source-kind))
+              '("chosen"))))
+        (when (file-directory-p tmp-dir)
+          (delete-directory tmp-dir t)))))
+
+  (ert-deftest veri-kompass-test-auto-enable-minor-mode-for-project-buffers ()
+    "Enable the minor mode automatically for project buffers only."
+    (let* ((file-a (expand-file-name "a.sv" temporary-file-directory))
+           (file-b (expand-file-name "b.sv" temporary-file-directory))
+           (veri-kompass-project-files (list file-a))
+           (veri-kompass-auto-enable-minor-mode t))
+      (with-temp-buffer
+        (setq buffer-file-name file-a)
+        (verilog-mode)
+        (veri-kompass--maybe-enable-minor-mode)
+        (should veri-kompass-minor-mode))
+      (with-temp-buffer
+        (setq buffer-file-name file-b)
+        (verilog-mode)
+        (veri-kompass--maybe-enable-minor-mode)
+        (should-not veri-kompass-minor-mode)))))
 
 (provide 'veri-kompass)
 

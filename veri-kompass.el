@@ -569,10 +569,41 @@ output directories whose names match REGEXP."
                   (veri-kompass-directory-files-recursively-with-symlink
                    dir veri-kompass-extention-regexp))))
 
+(defun veri-kompass--filelist-option-p (line)
+  "Return non-nil when LINE is a Verilog filelist option."
+  (or (string-prefix-p "+" line)
+      (string-prefix-p "-" line)))
+
+(defun veri-kompass--expand-filelist-token (token)
+  "Expand environment variables in filelist TOKEN."
+  (substitute-in-file-name token))
+
+(defun veri-kompass--filelist-candidate-paths (token base roots)
+  "Return candidate paths for filelist TOKEN relative to BASE and ROOTS."
+  (let ((expanded (veri-kompass--expand-filelist-token token)))
+    (if (file-name-absolute-p expanded)
+        (list expanded)
+      (delete-dups
+       (cons (expand-file-name expanded base)
+             (mapcar (lambda (root)
+                       (expand-file-name expanded root))
+                     roots))))))
+
+(defun veri-kompass--filelist-roots (base)
+  "Return plausible project roots for a filelist in BASE."
+  (let* ((base-dir (directory-file-name base))
+         (parent (file-name-directory base-dir)))
+    (delete-dups
+     (delq nil
+           (list default-directory
+                 parent)))))
+
 (defun veri-kompass--files-from-filelist (filelist)
   "Return a list of source files defined in FILELIST."
   (let ((base (file-name-directory (expand-file-name filelist)))
+        (roots nil)
         (result nil))
+    (setq roots (veri-kompass--filelist-roots base))
     (with-temp-buffer
       (insert-file-contents filelist)
       (while (not (eobp))
@@ -581,11 +612,14 @@ output directories whose names match REGEXP."
                (clean (string-trim line)))
           (unless (or (string-empty-p clean)
                       (string-prefix-p "#" clean)
-                      (string-prefix-p "//" clean))
-            (let ((candidate (expand-file-name clean base)))
-              (when (and (file-exists-p candidate)
-                         (veri-kompass--valid-source-file-p candidate))
-                (push candidate result)))))
+                      (string-prefix-p "//" clean)
+                      (veri-kompass--filelist-option-p clean))
+            (catch 'found
+              (dolist (candidate (veri-kompass--filelist-candidate-paths clean base roots))
+                (when (and (file-exists-p candidate)
+                           (veri-kompass--valid-source-file-p candidate))
+                  (push candidate result)
+                  (throw 'found candidate))))))
         (forward-line 1)))
     (delete-dups (nreverse result))))
 
@@ -1011,6 +1045,29 @@ The decendent parsing will start from module TOP-NAME."
               (insert "missing.v\n"))
             (should (equal (veri-kompass--files-from-filelist filelist)
                            (list foo bar))))
+        (when (file-directory-p tmp-dir)
+          (delete-directory tmp-dir t)))))
+  (ert-deftest veri-kompass-test-filelist-project-root-relative-paths ()
+    "Ensure filelists can contain root-relative paths and option lines."
+    (let ((tmp-dir (make-temp-file "veri-kompass-root-test" t)))
+      (unwind-protect
+          (let* ((default-directory temporary-file-directory)
+                 (rtl-dir (expand-file-name "rtl" tmp-dir))
+                 (source (expand-file-name "blinky.sv" rtl-dir))
+                 (filelist (expand-file-name "rtl/rtl.f" tmp-dir)))
+            (make-directory rtl-dir t)
+            (with-temp-file source
+              (insert "module blinky; endmodule\n"))
+            (with-temp-file filelist
+              (insert "-I${BASEJUMP_STL_DIR}/bsg_misc\n")
+              (insert "${BASEJUMP_STL_DIR}/bsg_misc/bsg_counter_up_down.sv\n")
+              (insert "rtl/blinky.sv\n"))
+            (should (equal (veri-kompass--files-from-filelist filelist)
+                           (list source)))
+            (should (equal (mapcar #'car
+                                   (veri-kompass-list-modules-in-proj
+                                    (veri-kompass--files-from-filelist filelist)))
+                           '("blinky"))))
         (when (file-directory-p tmp-dir)
           (delete-directory tmp-dir t)))))
   (ert-deftest veri-kompass-test-driver-input-without-local-driver-goes-up ()

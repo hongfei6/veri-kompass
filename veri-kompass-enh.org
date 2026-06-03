@@ -1,0 +1,71 @@
+* veri-kompass enhanced
+./veri-kompass目录里有个emacs脚本，是我根据github已有脚本稍微做了些改进。
+现在希望继续做改进，主要是针对以下缺点不足：
+- 跟踪驱动和负载线时需要更直观智能，目前不够直观，智能，请参考synopsys的工具verdi
+- 还是关于跟踪驱动和负载线，在跨模块时，如果信号名没有改变的，直接跨模块追踪到源
+  头，而不是停留在模块边界上
+- 给出其它相关的收效大的功能建议
+
+** 目标与使用场景
+优先服务 RTL debug 中的信号来源/去向追踪；层级理解作为辅助能力。交互保持 Emacs
+键盘优先：常见情况直接跳转，存在多个候选或歧义时打开可预览的结果 buffer。
+
+** 功能路线图
+*** Phase 1: 信号追踪闭环 MVP
+- 建立更清晰的 trace candidate 表示，记录方向、位置、代码片段和追踪原因。
+- 改进 =C-c d= / =C-c l= 的多候选结果窗口，上下移动时同步预览，=RET= 确认。
+- 支持同名信号跨模块自动穿透：例如子模块 =input clk= 连接父模块 =.clk(clk)= 时，继续向父层追踪。
+- 保持无外部依赖，先覆盖常见 module、port、assign、实例 named port connection。
+
+*** Phase 2: Verdi 风格但 Emacs 原生的结果体验
+- 候选结果显示方向、层级路径、文件行号和代码片段。
+- 追踪路径可解释每次跨模块跳转的原因。
+- 对低置信度或歧义结果给出提示，不静默跳错。
+
+*** Phase 3: 层级理解增强
+- hierarchy buffer 支持按实例名/模块名搜索，并展示更清晰的模块、实例、文件位置。
+- 增加当前信号穿过哪些 instance boundary 的辅助视图。
+- 增加跳到当前 module、跳到当前 instance module、返回上一追踪位置等命令。
+
+*** Phase 4: 高收益分析功能
+- 轻量 fanin/fanout 分析，列出直接来源和直接使用点。
+- 常见端口连接检查：未连接、同名连接、可能方向不匹配。
+- 解析缓存和重新索引命令，减少重复扫描。
+- Debug 历史，记录最近追踪过的信号和路径。
+
+** 当前实现计划
+- 不修改脚本文件名，继续使用 =veri-kompass/veri-kompass.el=，因为它匹配 package 名称和 =(provide 'veri-kompass)=。
+- 第一轮实现聚焦 Phase 1 的 driver 追踪：同名 input 跨父层继续追踪，以及统一候选预览窗口。
+- load 追踪先复用统一候选窗口，后续再扩展跨子层 fanout。
+- 新增 ERT 覆盖：同名跨模块 driver 追踪、多候选窗口 marker 预览、加载与字节编译。
+
+** 实现日志
+*** 2026-06-03
+- 记录路线图和文档同步约定：重要设计取舍、实现状态和验证结果后续默认写入本 org。
+- 决定不改主脚本文件名，不引入外部解析依赖。
+- 已实现第一轮源码改动：
+  - 新增 =veri-kompass-trace-candidate=，用于统一表示 driver/load 候选。
+  - 将原 load 候选窗口泛化为 trace selection，可用于 driver 多候选预览。
+  - 调整 driver 搜索顺序：本 module 内直接赋值优先；无本地 driver 的 input 视为可向父层追踪。
+  - 新增同名父层端口连接解析，支持 =.clk(clk)= 这类边界继续追踪。
+- 已新增 ERT 覆盖：input 无本地 driver、直接赋值优先、父层端口解析、trace candidate 展示。
+- 验证结果：
+  - =emacs -Q --batch -L veri-kompass -l veri-kompass/veri-kompass.el= 通过。
+  - =emacs -Q --batch -L veri-kompass -l veri-kompass/veri-kompass.el -f ert-run-tests-batch-and-exit= 通过，6/6。
+  - =emacs -Q --batch -L veri-kompass -f batch-byte-compile veri-kompass/veri-kompass.el= 通过；剩余 warning 为既有 docstring/可选 Helm/ERT runtime warning。
+- 使用 =sifferman/verilog_template= 试跑发现真实 filelist 问题：
+  - =rtl/rtl.f= 中路径按项目根目录写成 =rtl/blinky.sv=，当前 parser 错按 filelist 所在目录解析成 =rtl/rtl/blinky.sv=。
+  - filelist 中还有 =-I${BASEJUMP_STL_DIR}/...= 和环境变量路径，当前 parser 没有专门处理选项行。
+  - =module blinky import config_pkg::*; #(= 可被当前 module 正则识别，主要失败点是 filelist 为空。
+  - 下一步修复：忽略 include/define 等选项，展开环境变量，路径同时尝试 filelist 目录和调用时当前目录。
+- 已修复真实 filelist 兼容性：
+  - 新增 filelist 选项行识别，跳过 =+= 和 =-= 开头的 include/define 等参数。
+  - 新增环境变量展开，未定义变量对应的外部依赖会被自然跳过。
+  - 相对路径同时尝试 filelist 所在目录、调用时 =default-directory= 和 filelist 父目录，支持 =rtl/rtl.f= 中的 =rtl/blinky.sv=。
+  - 新增 ERT：=veri-kompass-test-filelist-project-root-relative-paths=。
+  - 用 =/tmp/verilog_template/rtl/rtl.f= 验证可解析出 =config_pkg.sv=、=blinky.sv=，top module 列表包含 =blinky=。
+  - 验证结果更新：加载通过，ERT 7/7 通过，byte-compile 通过；剩余 warning 仍为既有 docstring/可选 Helm/ERT runtime warning。
+- 关于 filelist 默认路径策略的结论：
+  - =rtl/rtl.f= 中写 =rtl/blinky.sv= 表示该工程主要从 =rtl/= 上一级目录执行，这种项目根目录相对路径在 RTL 工程中常见，值得默认支持。
+  - 支持方式应保持保守：相对路径按多个候选根目录尝试，但只接受实际存在且匹配 Verilog 源文件规则的路径。
+  - 这样既兼容 filelist 所在目录相对路径，也兼容项目根目录相对路径；如果两边都存在同名文件，优先 filelist 所在目录以保持原行为。

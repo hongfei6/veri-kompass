@@ -119,6 +119,10 @@
   "Holds a module instantiations."
   inst-name mod-name file-name line)
 
+(cl-defstruct (veri-kompass-trace-candidate (:copier nil))
+  "Holds one driver/load trace result."
+  direction label marker file line snippet reason trace)
+
 (defmacro veri-kompass-within-current-module (&rest code)
   "Execute code CODE narrowing into the current module definition."
   `(let* ((point-orig (point))
@@ -170,68 +174,130 @@ BUFF-NAME is the buffer name created in case helm is used."
     (re-search-forward veri-kompass-sym-regex nil t)
     (cons (match-string-no-properties 0) (veri-kompass-sym-classify-at-point))))
 
+(defun veri-kompass--search-direct-drivers (sym)
+  "Return direct assignment drivers for SYM in the current restriction."
+  (let ((res ()))
+    (goto-char (point-max))
+    (while (re-search-backward
+            (concat
+             "\\(\\<"
+             sym
+             "\\>\\)[[:space:]]*\\(\\[.*\\] +\\)?\\(=\\|<=\\)[^=].*")
+            nil t)
+      (push (cons (veri-kompass--line-snippet)
+                  (match-beginning 0))
+            res))
+    res))
+
+(defun veri-kompass--search-input-drivers (sym)
+  "Return input port declarations for SYM in the current restriction."
+  (let ((res ()))
+    (goto-char (point-min))
+    (while (re-search-forward
+            (concat
+             "input +\\(wire +\\)?\\(logic +\\)?\\(\\[[^]]+\\][[:space:]]*\\)?\\("
+             sym
+             "\\)")
+            nil t)
+      (push (cons (veri-kompass--line-snippet)
+                  (match-beginning 4))
+            res))
+    (nreverse res)))
+
+(defun veri-kompass--search-submodule-port-drivers (sym)
+  "Return submodule port connection candidates for SYM."
+  (let ((res ()))
+    (goto-char (point-max))
+    (while (re-search-backward
+            (concat
+             "\\..+([[:space:]]*\\("
+             sym
+             "\\)\\(\\[.*\\][[:space:]]*\\)?)")
+            nil t)
+      (push (cons (veri-kompass--line-snippet)
+                  (match-beginning 1))
+            res))
+    res))
+
+(defun veri-kompass--parent-port-signal-at-point (port-name)
+  "Return (SIGNAL . POSITION) for parent connection PORT-NAME near point."
+  (when (re-search-forward
+         (concat "\\."
+                 (regexp-quote port-name)
+                 "[[:space:]\n]*([[:space:]\n]*\\([0-9a-z_]+\\)")
+         nil t)
+    (cons (match-string-no-properties 1)
+          (match-beginning 1))))
+
 (defun veri-kompass-search-driver (sym &optional internal)
   "Given the symbol SYM search for it's driver.
 INTERNAL if the search is limited to the current module."
   (save-excursion
-    (let ((point-orig (point)))
-      (goto-char (point-min))
-      ;; First case is easy, in case is a module input.
-      (if (re-search-forward (concat
-                              "input +\\(wire +\\)?\\(logic +\\)?\\[*.*\] +\\("
-                              sym
-                              "\\)")
-                             nil t)
-          (if (and (equal (match-beginning 3) point-orig) (not internal))
-              'go-up
-            (list (cons (match-string 0) (match-beginning 3))))
-        (if (re-search-forward (concat "input +\\(wire +\\)?\\(logic +\\)?\\("
-                                       sym
-                                       "\\)")
-                               nil t)
-            (if (and (equal (match-beginning 3) point-orig) (not internal))
-                'go-up
-              (list (cons (match-string 0) (match-beginning 3))))
-          (goto-char (point-max))
-          ;; Here we handle direct assignments.
-          (let ((res ()))
-            (while (re-search-backward
-                    (concat
-                     "\\(\\<"
-                     sym
-                     "\\>\\)[[:space:]]*\\(\\[.*\\] +\\)?\\(=\\|<=\\)[^=].*")
-                    nil t)
-              (push (cons (match-string 0)
-                          (match-beginning 0))
-                    res))
-            (if res
-                res
-              ;; Otherwise is coming from e submodule. TODO: check input/output!
-              (while (re-search-backward
-                      (concat
-                       "\\..+([[:space:]]*\\("
-                       sym
-                       "\\)\\(\\[.*\\][[:space:]]*\\)?)")
-                      nil t)
-                (push (cons (match-string 0)
-                            (match-beginning 1))
-                      res))
-              res)))))))
+    (let ((direct (veri-kompass--search-direct-drivers sym)))
+      (if direct
+          direct
+        (let ((inputs (veri-kompass--search-input-drivers sym)))
+          (cond
+           ((and inputs (not internal))
+            'go-up)
+           (inputs
+            inputs)
+           (t
+            (veri-kompass--search-submodule-port-drivers sym))))))))
+
+(defun veri-kompass--go-up-same-name-from-point (signal-name)
+  "Move from current input SIGNAL-NAME to the same-name parent connection.
+Return `same' for same-name, `renamed' for renamed, or nil on failure."
+  (if veri-kompass-curr-select
+      (let* ((curr-mark (veri-kompass-curr-mark))
+             (mark-mod (car curr-mark))
+             (mark-inst (cdr curr-mark))
+             (module-name (veri-kompass-module-name-at-point)))
+        (if (not (equal module-name mark-mod))
+            (progn
+              (message "Marked module is different from current one.")
+              nil)
+          (set-buffer (veri-kompass-go-up 'jump))
+          (search-forward mark-inst nil t)
+          (let ((connection (veri-kompass--parent-port-signal-at-point signal-name)))
+            (when connection
+              (let ((parent-signal (car connection))
+                    (parent-pos (cdr connection)))
+              (goto-char parent-pos)
+              (if (equal parent-signal signal-name)
+                  'same
+                (message "Signal %s is renamed to %s at parent boundary."
+                         signal-name parent-signal)
+                'renamed))))))
+    (message "Please mark current instance into hierarchy buffer.")
+    nil))
+
+(defun veri-kompass--search-driver-at-point-rec (sym depth)
+  "Search driver for SYM at point, climbing same-name inputs up to DEPTH."
+  (veri-kompass-within-current-module
+   (let ((res (veri-kompass-search-driver sym)))
+     (cond
+      ((eq res 'go-up)
+       (pcase (and (> depth 0)
+                   (veri-kompass--go-up-same-name-from-point sym))
+         ('same
+          (veri-kompass--search-driver-at-point-rec sym (1- depth)))
+         ('renamed
+          nil)
+         (_
+          (veri-kompass-go-up-from-point))))
+      ((null res)
+       (message "Cannot find driver for %s" sym))
+      ((equal (length res) 1)
+       (goto-char (cdar res)))
+      (t
+       (veri-kompass--show-trace-selection res "Select driver line"))))))
 
 (defun veri-kompass-search-driver-at-point ()
   "Goto the driver for symbol at point."
   (interactive)
-  (veri-kompass-within-current-module
-   (let ((res (veri-kompass-search-driver (car (veri-kompass-sym-at-point)))))
-     (when res
-       (if (eq res 'go-up)
-           (veri-kompass-go-up-from-point)
-         (if (equal (length res) 1)
-             (goto-char (cdar res))
-           (goto-char
-	    (veri-kompass-completing-read "select driver line: "
-					  res
-					  "*veri-kompass-driver-select*"))))))))
+  (veri-kompass--search-driver-at-point-rec
+   (car (veri-kompass-sym-at-point)) 32))
 
 (defun veri-kompass-module-name-at-point ()
   "Return the module containing the current point."
@@ -254,6 +320,50 @@ INTERNAL if the search is limited to the current module."
 
 (defvar-local veri-kompass-load-select--origin-window nil
   "Window that displayed the source buffer when load selection started.")
+
+(defun veri-kompass--line-snippet ()
+  "Return the current line trimmed for candidate display."
+  (string-trim
+   (buffer-substring-no-properties
+    (line-beginning-position) (line-end-position))))
+
+(defun veri-kompass--candidate-marker (candidate origin-buffer)
+  "Return a marker for CANDIDATE, using ORIGIN-BUFFER for legacy candidates."
+  (cond
+   ((veri-kompass-trace-candidate-p candidate)
+    (veri-kompass-trace-candidate-marker candidate))
+   ((markerp (cdr candidate))
+    (cdr candidate))
+   (t
+    (with-current-buffer origin-buffer
+      (copy-marker (cdr candidate))))))
+
+(defun veri-kompass--candidate-display (candidate)
+  "Return display text for CANDIDATE."
+  (if (veri-kompass-trace-candidate-p candidate)
+      (let ((prefix (upcase (symbol-name
+                             (veri-kompass-trace-candidate-direction candidate))))
+            (line (veri-kompass-trace-candidate-line candidate))
+            (snippet (veri-kompass-trace-candidate-snippet candidate))
+            (reason (veri-kompass-trace-candidate-reason candidate)))
+        (string-join
+         (remove nil
+                 (list prefix
+                       (veri-kompass-trace-candidate-label candidate)
+                       (when line (format "line %s" line))
+                       reason
+                       snippet))
+         " | "))
+    (car candidate)))
+
+(defun veri-kompass--goto-candidate (candidate origin-buffer)
+  "Go to CANDIDATE in ORIGIN-BUFFER."
+  (let ((marker (veri-kompass--candidate-marker candidate origin-buffer)))
+    (when (and (markerp marker)
+               (buffer-live-p (marker-buffer marker)))
+      (switch-to-buffer (marker-buffer marker))
+      (goto-char marker)
+      t)))
 
 (defun veri-kompass-load-select--current-marker ()
   "Return the marker stored on the current line, if any."
@@ -367,8 +477,8 @@ DIRECTION should be positive to move down or negative to move up."
   (setq truncate-lines t)
   (hl-line-mode 1))
 
-(defun veri-kompass--show-load-selection (candidates)
-  "Show CANDIDATES in the load selection buffer."
+(defun veri-kompass--show-trace-selection (candidates title)
+  "Show trace CANDIDATES in the selection buffer using TITLE."
   (let* ((origin-window (selected-window))
          (buffer (get-buffer-create veri-kompass-load-select-buffer-name))
          (origin-buffer (window-buffer origin-window)))
@@ -377,12 +487,11 @@ DIRECTION should be positive to move down or negative to move up."
       (setq veri-kompass-load-select--origin-window origin-window)
       (let ((inhibit-read-only t))
         (erase-buffer)
-        (insert "Select load line (C-j/C-k to preview, RET to jump, q to quit).\n\n")
+        (insert title " (C-j/C-k to preview, RET to jump, q to quit).\n\n")
         (dolist (cand candidates)
           (let* ((line-start (point))
-                 (marker (with-current-buffer origin-buffer
-                           (copy-marker (cdr cand)))))
-            (insert (car cand) "\n")
+                 (marker (veri-kompass--candidate-marker cand origin-buffer)))
+            (insert (veri-kompass--candidate-display cand) "\n")
             (put-text-property line-start (1- (point))
                                'veri-kompass-load-marker marker))))
       (let ((first (veri-kompass-load-select--first-candidate-pos)))
@@ -391,6 +500,10 @@ DIRECTION should be positive to move down or negative to move up."
     (pop-to-buffer buffer '(display-buffer-pop-up-window))
     (with-current-buffer buffer
       (veri-kompass-load-select--preview-at-point))))
+
+(defun veri-kompass--show-load-selection (candidates)
+  "Show load CANDIDATES in the selection buffer."
+  (veri-kompass--show-trace-selection candidates "Select load line"))
 
 (defun veri-kompass-search-load-at-point ()
   "Goto the loads for symbol at point."
@@ -900,6 +1013,52 @@ The decendent parsing will start from module TOP-NAME."
                            (list foo bar))))
         (when (file-directory-p tmp-dir)
           (delete-directory tmp-dir t)))))
+  (ert-deftest veri-kompass-test-driver-input-without-local-driver-goes-up ()
+    "Ensure input-only signals are treated as parent-driven."
+    (with-temp-buffer
+      (insert "module child(input clk, output out);\n")
+      (insert "assign out = clk;\n")
+      (insert "endmodule\n")
+      (should (eq (veri-kompass-search-driver "clk") 'go-up))))
+  (ert-deftest veri-kompass-test-driver-direct-assignment-wins ()
+    "Ensure local direct drivers are preferred over input declarations."
+    (with-temp-buffer
+      (insert "module child(input clk, input root_clk);\n")
+      (insert "assign clk = root_clk;\n")
+      (insert "endmodule\n")
+      (let ((drivers (veri-kompass-search-driver "clk")))
+        (should (listp drivers))
+        (should (string-match-p "assign clk = root_clk" (caar drivers))))))
+  (ert-deftest veri-kompass-test-parent-port-signal-parser ()
+    "Ensure parent port parsing distinguishes same-name and renamed nets."
+    (with-temp-buffer
+      (insert "child u_child (\n")
+      (insert "  .clk(clk),\n")
+      (insert "  .rst(parent_rst)\n")
+      (insert ");\n")
+      (goto-char (point-min))
+      (let ((clk (veri-kompass--parent-port-signal-at-point "clk")))
+        (should (equal (car clk) "clk"))
+        (goto-char (cdr clk))
+        (should (looking-at "clk")))
+      (goto-char (point-min))
+      (should (equal (car (veri-kompass--parent-port-signal-at-point "rst"))
+                     "parent_rst"))))
+  (ert-deftest veri-kompass-test-trace-candidate-display ()
+    "Ensure structured trace candidates render useful result lines."
+    (with-temp-buffer
+      (insert "assign clk = root_clk;\n")
+      (let ((candidate (make-veri-kompass-trace-candidate
+                        :direction 'driver
+                        :label "top.clk"
+                        :marker (copy-marker (point-min))
+                        :line 1
+                        :snippet "assign clk = root_clk;"
+                        :reason "same-name parent")))
+        (should (string-match-p "DRIVER | top.clk | line 1"
+                                (veri-kompass--candidate-display candidate)))
+        (should (string-match-p "same-name parent"
+                                (veri-kompass--candidate-display candidate))))))
   (ert-deftest veri-kompass-test-load-select-preview ()
     "Ensure moving across load entries previews the source location."
     (with-temp-buffer

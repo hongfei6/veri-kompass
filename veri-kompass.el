@@ -92,6 +92,9 @@
 (defconst veri-kompass-ignore-keywords '("if" "task" "assert" "disable" "define" "posedge"
                                          "negedge" "int" "for" "logic" "wire" "reg"))
 
+(defconst veri-kompass-ident-regex "[a-zA-Z_][a-zA-Z0-9_$]*"
+  "Regexp matching a common Verilog identifier.")
+
 (defconst veri-kompass-sym-regex "[0-9a-z_]+")
 
 (defconst veri-kompass-ops-regex "[\]\[ ()|&\+-/%{}=<>]")
@@ -101,13 +104,16 @@
   "Regexp matching optional SystemVerilog import clauses in a module header.")
 
 (defconst veri-kompass-module-start-regexp
-  (concat "module[[:space:]\n]+\\([0-9a-z_]+\\)"
+  (concat "module[[:space:]\n]+\\(" veri-kompass-ident-regex "\\)"
           veri-kompass-module-import-clause-regexp))
 
 (defconst veri-kompass-module-end-regexp "^[[:space:]]*endmodule")
 
 (defvar veri-kompass-hier nil
   "Holds the design hierarchy.")
+
+(defvar veri-kompass-hier-warnings nil
+  "Warnings collected while building the hierarchy.")
 
 (defvar veri-kompass-curr-select nil
   "Holds the position of the current instance selected (if any).")
@@ -641,7 +647,9 @@ SOURCE can be a directory or a file list."
     (insert-file-contents-literally file)
     (let ((mod-list))
       (while (re-search-forward
-              (concat "^[[:space:]]*module[[:space:]\n]+\\([0-9a-z_]+\\)"
+              (concat "^[[:space:]]*module[[:space:]\n]+\\("
+                      veri-kompass-ident-regex
+                      "\\)"
                       veri-kompass-module-import-clause-regexp
                       "[[:space:]]*\n*[[:space:]]*\\((\\|#(\\|`\\|;\\)")
               nil t)
@@ -662,6 +670,14 @@ SOURCE can be a directory or a file list."
 (defun veri-kompass-mod-to-file-name-pos (name)
   "Given the module name NAME return its position." ;; improve
   (cdr (assoc name veri-kompass-module-list)))
+
+(defun veri-kompass--add-hier-warning (fmt &rest args)
+  "Record a hierarchy warning formatted with FMT and ARGS."
+  (push (apply #'format fmt args) veri-kompass-hier-warnings))
+
+(defun veri-kompass--ignored-inst-token-p (token)
+  "Return non-nil when TOKEN should not be treated as a module or instance."
+  (member (downcase token) veri-kompass-ignore-keywords))
 
 (defun veri-kompass-mark-comments ()
   "Scanning a buffer mark all comments with property 'comment."
@@ -738,65 +754,85 @@ SOURCE can be a directory or a file list."
   "Given MOD-NAME return a list rappresenting the design hierarchy.
 This recursive function call itself walking all the verilog design."
   (veri-kompass-thread-yield)
-  (if (gethash mod-name veri-kompass-mod-str-hash) ;; some memoization is gonna help
-      (gethash mod-name veri-kompass-mod-str-hash)
-    (puthash
-     mod-name
-     (let ((target (veri-kompass-mod-to-file-name-pos mod-name))
-           (struct)
-           (orig-buff))
-       (if target
-           (with-temp-buffer
-             (insert-file-contents-literally (car target))
-             (setq orig-buff (buffer-string))
-             (goto-char (cadr target))
-             (set-mark (point))
-             (re-search-forward veri-kompass-module-end-regexp nil t)
-             (narrow-to-region (mark) (point))
-             (veri-kompass-thread-yield)
-             (veri-kompass-delete-parameters)
-             (veri-kompass-thread-yield)
-             (veri-kompass-remove-macros)
-             (veri-kompass-thread-yield)
-             (veri-kompass-mark-code-blocks)
-             (veri-kompass-thread-yield)
-             (goto-char (point-min))
-             (while (re-search-forward
-                     "\\([0-9a-z_]+\\)[[:space:]]+\\([0-9a-z_]+\\)[[:space:]]*("  nil t)
-               (when (save-match-data
-                       (veri-kompass-thread-yield)
-                       (veri-kompass-forward-balanced)
-                       (looking-at "[[:space:]]*;"))
-                 (unless (or (get-char-property 0 'code (match-string 0))
-                             (get-char-property 0 'comment (match-string 0))
-                             (char-equal (aref (match-string-no-properties 1) 0)
-                                         ?\`)
-                             (member (match-string-no-properties 1)
-                                     veri-kompass-ignore-keywords)
-                             (member (match-string-no-properties 2)
-                                     veri-kompass-ignore-keywords))
-                   (veri-kompass-thread-yield)
-                   (push (make-veri-kompass-mod-inst
-                          :mod-name (match-string-no-properties 1)
-                          :inst-name (match-string-no-properties 2)
-                          :file-name (car target)
-                          :line (veri-kompass-retrive-original-line (match-string 1)
-                                                                    (match-string 2)
-                                                                    orig-buff)) struct)
-                   (let ((sub-hier
-                          (veri-kompass-build-hier-rec
-                           (match-string-no-properties 1))))
-                     (when sub-hier
-                       (push sub-hier struct)))
-                   )))
-             (reverse struct))
-         (message "Cannot find module %s" mod-name)
-         nil))
-     veri-kompass-mod-str-hash)))
+  (let ((cached (gethash mod-name veri-kompass-mod-str-hash :missing)))
+    (cond
+     ((eq cached :building)
+      (veri-kompass--add-hier-warning
+       "Detected recursive hierarchy while parsing module %s" mod-name)
+      nil)
+     ((not (eq cached :missing))
+      cached)
+     (t
+      (puthash mod-name :building veri-kompass-mod-str-hash)
+      (let ((hier
+             (let ((target (veri-kompass-mod-to-file-name-pos mod-name))
+                   (struct)
+                   (orig-buff))
+               (if target
+                   (with-temp-buffer
+                     (insert-file-contents-literally (car target))
+                     (setq orig-buff (buffer-string))
+                     (goto-char (cadr target))
+                     (set-mark (point))
+                     (re-search-forward veri-kompass-module-end-regexp nil t)
+                     (narrow-to-region (mark) (point))
+                     (veri-kompass-thread-yield)
+                     (veri-kompass-delete-parameters)
+                     (veri-kompass-thread-yield)
+                     (veri-kompass-remove-macros)
+                     (veri-kompass-thread-yield)
+                     (veri-kompass-mark-code-blocks)
+                     (veri-kompass-thread-yield)
+                     (goto-char (point-min))
+                     (while (re-search-forward
+                             (concat "\\(" veri-kompass-ident-regex "\\)"
+                                     "[[:space:]]+"
+                                     "\\(" veri-kompass-ident-regex "\\)"
+                                     "[[:space:]]*(")
+                             nil t)
+                       (when (save-match-data
+                               (veri-kompass-thread-yield)
+                               (veri-kompass-forward-balanced)
+                               (looking-at "[[:space:]]*;"))
+                         (unless (or (get-char-property 0 'code (match-string 0))
+                                     (get-char-property 0 'comment (match-string 0))
+                                     (char-equal (aref (match-string-no-properties 1) 0)
+                                                 ?\`)
+                                     (veri-kompass--ignored-inst-token-p
+                                      (match-string-no-properties 1))
+                                     (veri-kompass--ignored-inst-token-p
+                                      (match-string-no-properties 2)))
+                           (veri-kompass-thread-yield)
+                           (let* ((child-mod (match-string-no-properties 1))
+                                  (child-inst (match-string-no-properties 2))
+                                  (child-line
+                                   (veri-kompass-retrive-original-line child-inst
+                                                                       child-mod
+                                                                       orig-buff)))
+                             (push (make-veri-kompass-mod-inst
+                                    :mod-name child-mod
+                                    :inst-name child-inst
+                                    :file-name (car target)
+                                    :line child-line)
+                                   struct)
+                             (unless (veri-kompass-mod-to-file-name-pos child-mod)
+                               (veri-kompass--add-hier-warning
+                                "Cannot find module %s instantiated as %s at %s:%s"
+                                child-mod child-inst (car target) child-line))
+                             (let ((sub-hier
+                                    (veri-kompass-build-hier-rec child-mod)))
+                               (when sub-hier
+                                 (push sub-hier struct)))))))
+                     (reverse struct))
+                 (message "Cannot find module %s" mod-name)
+                 nil))))
+        (puthash mod-name hier veri-kompass-mod-str-hash)
+        hier)))))
 
 (defun veri-kompass-build-hier (top)
   "Given a TOP module return the hierarcky.
 This is the entry point function for parsing the design."
+  (setq veri-kompass-hier-warnings nil)
   (let ((target (veri-kompass-mod-to-file-name-pos top)))
     (if target
         (list (make-veri-kompass-mod-inst
@@ -805,6 +841,7 @@ This is the entry point function for parsing the design."
                :file-name (car target)
                :line (caddr target))
               (veri-kompass-build-hier-rec top))
+      (veri-kompass--add-hier-warning "Cannot find top module %s" top)
       (message "Cannot find top module %s" top))))
 
 (defun veri-kompass-orgify-link (inst)
@@ -831,17 +868,32 @@ This is the entry point function for parsing the design."
                  (format "%s %s" (let ((x ""))
                                    (dotimes (_ nest)
                                      (setq x (concat x "*")))
-                                   x)
-                         (veri-kompass-orgify-link h)))) hier "\n"))
+                                    x)
+                          (veri-kompass-orgify-link h)))) hier "\n"))
+
+(defun veri-kompass-orgify-hier-warnings ()
+  "Return org text for hierarchy warnings."
+  (when veri-kompass-hier-warnings
+    (concat "\n\n* veri-kompass warnings\n"
+            (mapconcat (lambda (warning)
+                         (concat "- " warning))
+                       (nreverse veri-kompass-hier-warnings)
+                       "\n"))))
 
 (defun veri-kompass-compute-and-create-bar (top-name)
   "Given a top module TOP-NAME create and populate the hierarky bar."
   (setq veri-kompass-hier (veri-kompass-build-hier top-name))
-  (message "Parsing done.")
+  (message "Parsing done%s."
+           (if veri-kompass-hier-warnings
+               (format " with %s warning(s)" (length veri-kompass-hier-warnings))
+             ""))
   (switch-to-buffer-other-window veri-kompass-bar-name)
   (let ((inhibit-read-only t))
     (erase-buffer)
-    (insert (veri-kompass-orgify-hier veri-kompass-hier 1)))
+    (insert (or (veri-kompass-orgify-hier veri-kompass-hier 1) ""))
+    (let ((warnings (veri-kompass-orgify-hier-warnings)))
+      (when warnings
+        (insert warnings))))
   (read-only-mode)
   (veri-kompass-mode)
   (highlight-regexp "->\\|<-" 'veri-kompass-inst-marked-face)
@@ -1070,6 +1122,49 @@ The decendent parsing will start from module TOP-NAME."
                            '("blinky"))))
         (when (file-directory-p tmp-dir)
           (delete-directory tmp-dir t)))))
+  (ert-deftest veri-kompass-test-hierarchy-recognizes-uppercase-instance ()
+    "Ensure uppercase module and instance identifiers are included."
+    (let ((tmp-file (make-temp-file "veri-kompass-upper" nil ".sv")))
+      (unwind-protect
+          (progn
+            (with-temp-file tmp-file
+              (insert "module ChildModule;\n")
+              (insert "endmodule\n")
+              (insert "module TopModule;\n")
+              (insert "  ChildModule U_CHILD ();\n")
+              (insert "endmodule\n"))
+            (let* ((veri-kompass-module-list
+                    (veri-kompass-list-modules-in-file tmp-file))
+                   (veri-kompass-mod-str-hash (make-hash-table :test 'equal))
+                   (hier (veri-kompass-build-hier "TopModule")))
+              (should (equal veri-kompass-hier-warnings nil))
+              (should (string-match-p
+                       "U_CHILD"
+                       (veri-kompass-orgify-hier hier 1)))))
+        (when (file-exists-p tmp-file)
+          (delete-file tmp-file)))))
+  (ert-deftest veri-kompass-test-hierarchy-warns-for-missing-module ()
+    "Ensure missing instantiated modules are reported."
+    (let ((tmp-file (make-temp-file "veri-kompass-missing" nil ".sv")))
+      (unwind-protect
+          (progn
+            (with-temp-file tmp-file
+              (insert "module top;\n")
+              (insert "  MissingModule u_missing ();\n")
+              (insert "endmodule\n"))
+            (let ((veri-kompass-module-list
+                   (veri-kompass-list-modules-in-file tmp-file))
+                  (veri-kompass-mod-str-hash (make-hash-table :test 'equal)))
+              (veri-kompass-build-hier "top")
+              (should (equal (length veri-kompass-hier-warnings) 1))
+              (should (string-match-p
+                       "Cannot find module MissingModule instantiated as u_missing"
+                       (car veri-kompass-hier-warnings)))
+              (should (string-match-p
+                       "veri-kompass warnings"
+                       (veri-kompass-orgify-hier-warnings)))))
+        (when (file-exists-p tmp-file)
+          (delete-file tmp-file)))))
   (ert-deftest veri-kompass-test-driver-input-without-local-driver-goes-up ()
     "Ensure input-only signals are treated as parent-driven."
     (with-temp-buffer

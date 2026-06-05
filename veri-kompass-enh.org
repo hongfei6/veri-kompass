@@ -69,3 +69,18 @@
   - =rtl/rtl.f= 中写 =rtl/blinky.sv= 表示该工程主要从 =rtl/= 上一级目录执行，这种项目根目录相对路径在 RTL 工程中常见，值得默认支持。
   - 支持方式应保持保守：相对路径按多个候选根目录尝试，但只接受实际存在且匹配 Verilog 源文件规则的路径。
   - 这样既兼容 filelist 所在目录相对路径，也兼容项目根目录相对路径；如果两边都存在同名文件，优先 filelist 所在目录以保持原行为。
+*** 2026-06-05
+- 真实试用发现：个别 instance 可能没有展示在 hierarchy 中，且缺少明显提示。
+- 已加强 hierarchy 检查：
+  - module/instance 识别从小写限定正则扩展为常见 Verilog identifier，支持大写模块名和实例名。
+  - 新增 =veri-kompass-hier-warnings=，构建 hierarchy 时收集明显问题。
+  - 找不到实例化模块定义时，在 hierarchy buffer 末尾追加 =* veri-kompass warnings=，包含模块名、实例名、文件和行号。
+  - 增加递归构建保护，遇到循环层级或误解析导致的递归时记录 warning 并停止该分支，避免无限递归。
+- 新增 ERT 覆盖：
+  - =veri-kompass-test-hierarchy-recognizes-uppercase-instance=
+  - =veri-kompass-test-hierarchy-warns-for-missing-module=
+- 验证结果：
+  - 加载通过。
+  - ERT 9/9 通过。
+  - byte-compile 通过；剩余 warning 仍为既有 docstring/可选 Helm/ERT runtime warning。
+  - =/tmp/verilog_template/rtl/rtl.f= 仍可解析出 top module =blinky=。

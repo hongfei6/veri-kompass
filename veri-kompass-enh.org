@@ -84,3 +84,20 @@
   - ERT 9/9 通过。
   - byte-compile 通过；剩余 warning 仍为既有 docstring/可选 Helm/ERT runtime warning。
   - =/tmp/verilog_template/rtl/rtl.f= 仍可解析出 top module =blinky=。
+- 使用本仓库 =src/rtl.f= 发现 top module =TOP= 不在候选列表。
+- 根因：
+  - =src/TOP/TOP.v= 使用 =module TOP # (= 形式，=#= 和 =(= 中间有空格。
+  - 当前 module 声明正则只接受 =#(=，不接受 =# (=，因此整个 =TOP= module 没进入 =veri-kompass-module-list=。
+  - 同类问题也会影响 instance 参数块删除和层级识别，例如 =TOP_controller # (=。
+- 已修复：
+  - 新增 =veri-kompass-parameter-start-regexp=，统一识别 =#[[:space:]\n]*(=。
+  - module 声明识别支持 =# (=。
+  - 参数块删除支持 =# (=，使参数化 instance 在 hierarchy 扫描前能正常归一化。
+- 新增 ERT 覆盖：
+  - =veri-kompass-test-module-header-with-spaced-parameter-block=
+  - =veri-kompass-test-parameterized-instance-with-spaced-block=
+- 验证结果：
+  - =src/rtl.f= 可解析出 58 个源文件，module list 包含 =TOP=，位置为 =src/TOP/TOP.v:1=。
+  - 加载通过。
+  - ERT 11/11 通过。
+  - byte-compile 通过；剩余 warning 仍为既有 docstring/可选 Helm/ERT runtime warning。

@@ -109,6 +109,9 @@
 
 (defconst veri-kompass-module-end-regexp "^[[:space:]]*endmodule")
 
+(defconst veri-kompass-parameter-start-regexp "#[[:space:]\n]*("
+  "Regexp matching the start of a Verilog parameter override block.")
+
 (defvar veri-kompass-hier nil
   "Holds the design hierarchy.")
 
@@ -651,7 +654,7 @@ SOURCE can be a directory or a file list."
                       veri-kompass-ident-regex
                       "\\)"
                       veri-kompass-module-import-clause-regexp
-                      "[[:space:]]*\n*[[:space:]]*\\((\\|#(\\|`\\|;\\)")
+                      "[[:space:]]*\n*[[:space:]]*\\((\\|#[[:space:]\n]*(\\|`\\|;\\)")
               nil t)
         (push (list
                (match-string-no-properties 1)
@@ -724,7 +727,7 @@ SOURCE can be a directory or a file list."
   "Remove all #( ... )."
   (save-excursion
     (goto-char (point-min))
-    (while (re-search-forward "#(" nil t)
+    (while (re-search-forward veri-kompass-parameter-start-regexp nil t)
       (veri-kompass-forward-balanced)
       (delete-region (match-beginning 0) (point)))))
 
@@ -1163,6 +1166,43 @@ The decendent parsing will start from module TOP-NAME."
               (should (string-match-p
                        "veri-kompass warnings"
                        (veri-kompass-orgify-hier-warnings)))))
+        (when (file-exists-p tmp-file)
+          (delete-file tmp-file)))))
+  (ert-deftest veri-kompass-test-module-header-with-spaced-parameter-block ()
+    "Ensure module declarations using `# (' are recognized."
+    (let ((tmp-file (make-temp-file "veri-kompass-param-top" nil ".v")))
+      (unwind-protect
+          (progn
+            (with-temp-file tmp-file
+              (insert "module TOP # (\n")
+              (insert "  parameter WIDTH = 8\n")
+              (insert ") (\n")
+              (insert "  input clk\n")
+              (insert ");\n")
+              (insert "endmodule\n"))
+            (should (equal (mapcar #'car
+                                   (veri-kompass-list-modules-in-file tmp-file))
+                           '("TOP"))))
+        (when (file-exists-p tmp-file)
+          (delete-file tmp-file)))))
+  (ert-deftest veri-kompass-test-parameterized-instance-with-spaced-block ()
+    "Ensure instances using `# (' parameter blocks are kept in hierarchy."
+    (let ((tmp-file (make-temp-file "veri-kompass-param-inst" nil ".v")))
+      (unwind-protect
+          (progn
+            (with-temp-file tmp-file
+              (insert "module child #(parameter WIDTH = 8) (); endmodule\n")
+              (insert "module top;\n")
+              (insert "  child # (\n")
+              (insert "    .WIDTH(16)\n")
+              (insert "  ) u_child ();\n")
+              (insert "endmodule\n"))
+            (let* ((veri-kompass-module-list
+                    (veri-kompass-list-modules-in-file tmp-file))
+                   (veri-kompass-mod-str-hash (make-hash-table :test 'equal))
+                   (hier (veri-kompass-build-hier "top")))
+              (should (string-match-p "u_child"
+                                      (veri-kompass-orgify-hier hier 1)))))
         (when (file-exists-p tmp-file)
           (delete-file tmp-file)))))
   (ert-deftest veri-kompass-test-driver-input-without-local-driver-goes-up ()

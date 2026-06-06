@@ -163,3 +163,39 @@
 - 验证结果：
   - =emacs -Q --batch -L veri-kompass -l veri-kompass/veri-kompass.el -f ert-run-tests-batch-and-exit= 通过，22/22。
   - =emacs -Q --batch -L veri-kompass -f batch-byte-compile veri-kompass/veri-kompass.el= 通过；剩余 warning 仍为既有 docstring/可选 Helm/ERT runtime warning。
+- 需求更新：继续 Phase 1，补齐 =C-c l= 的跨子模块 fanout/load 追踪。
+- 已实现：
+  - 新增当前 module 内 submodule instance 扫描，支持普通实例和 =#(...)= / =# (...)= 参数覆盖后的 named port connection。
+  - load 追踪遇到 =.port(signal)= 时，会查询 child module 的 port 方向；=input= / =inout= 视为可追踪 load，=output= 不再误判为 load。
+  - 对 child input/inout，进入 child module 查找该 port 的直接使用点，并生成结构化 =load= candidate，候选 label 形如 =u_child.clk=。
+  - renamed connection 如 =.child_clk(clk)= 会在候选 reason 中标注 =renamed boundary=。
+  - 复杂连接表达式暂不自动深入，仅覆盖简单 named connection：=.port(signal)= 或带简单 bit select 的 =.port(signal[idx])=。
+- 修复：
+  - 过滤 =.out(foo)= 这类 child output 连接，避免旧文本 load 搜索把 child output 当作 fanout。
+  - 修正新增 instance 扫描的括号边界，避免第一个 instance 的扫描范围吞掉后续 instance。
+- 新增 ERT 覆盖：
+  - =veri-kompass-test-load-crosses-child-input-port=
+  - =veri-kompass-test-load-ignores-child-output-port=
+  - =veri-kompass-test-load-crosses-renamed-child-input-port=
+  - =veri-kompass-test-load-multiple-child-input-fanout=
+- 验证结果：
+  - =emacs -Q --batch -L veri-kompass -l veri-kompass/veri-kompass.el -f ert-run-tests-batch-and-exit= 通过，26/26。
+  - =emacs -Q --batch -L veri-kompass -f batch-byte-compile veri-kompass/veri-kompass.el= 通过；剩余 warning 仍为既有 docstring/可选 Helm/ERT runtime warning。
+- 真实试用发现：光标位于 =src/TOP/TOP_controller.v:56= 的 =CG_0_0_GLB_iact_0_1_in_en= output port 上按 =C-c l= 时，被错误提示为顶层边界，无法追到父层负载。
+- 根因：
+  - =C-c l= 对 output port declaration 直接短路为 boundary message，没有先尝试从当前 hierarchy mark 上溯到父实例连接。
+  - 父层连接解析仍使用小写限定 symbol 规则，对大写信号名不够稳。
+  - 新增 fanout 实例扫描中，参数块跳过从 =(= 本身开始 balance，遇到 =TOP_controller # (...) TOP_controller (...)= 会吞过头，导致 child output 连接过滤失效。
+- 已修复：
+  - output port 上执行 =C-c l= 时，若当前 instance 已在 hierarchy 中 mark，则先上溯到父层连接，再追踪父层实际 load；只有无法上溯时才提示边界。
+  - 父层 load 候选转换为带 marker 的结构化 candidate，支持预览、=RET= 跳转和 trace history。
+  - symbol-at-point 和 parent port connection 解析统一使用 Verilog identifier 规则，支持大写信号。
+  - 本地 load 搜索过滤 wire/reg/logic/input/output/inout 声明行，避免把父层 wire declaration 当作 load。
+  - 修正参数化实例扫描的括号起点，确保能识别真实 =TOP_controller # (...) TOP_controller (...)= 实例。
+- 新增/扩展 ERT 覆盖：
+  - =veri-kompass-test-load-output-port-goes-up-to-parent-load=
+  - =veri-kompass-test-parent-port-signal-parser= 增加大写 parent signal 解析断言。
+- 验证结果：
+  - 真实 =src/rtl.f= + =TOP= hierarchy 中，从 =TOP_controller.v:56= 按 =C-c l= 可进入候选框，首个实际 load 为 =src/TOP/TOP.v:2019=。
+  - =emacs -Q --batch -L veri-kompass -l veri-kompass/veri-kompass.el -f ert-run-tests-batch-and-exit= 通过，27/27。
+  - =emacs -Q --batch -L veri-kompass -f batch-byte-compile veri-kompass/veri-kompass.el= 通过；剩余 warning 仍为既有 docstring/可选 Helm/ERT runtime warning。

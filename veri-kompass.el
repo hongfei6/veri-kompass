@@ -95,12 +95,14 @@
   "Buffer displaying the list of loads when multiple entries exist.")
 
 (defconst veri-kompass-ignore-keywords '("if" "task" "assert" "disable" "define" "posedge"
-                                         "negedge" "int" "for" "logic" "wire" "reg"))
+                                         "negedge" "int" "for" "logic" "wire" "reg"
+                                         "module" "endmodule"))
 
 (defconst veri-kompass-ident-regex "[a-zA-Z_][a-zA-Z0-9_$]*"
   "Regexp matching a common Verilog identifier.")
 
-(defconst veri-kompass-sym-regex "[0-9a-z_]+")
+(defconst veri-kompass-sym-regex veri-kompass-ident-regex
+  "Regexp matching a Verilog symbol at point.")
 
 (defconst veri-kompass-ops-regex "[\]\[ ()|&\+-/%{}=<>]")
 
@@ -268,6 +270,16 @@ BUFF-NAME is the buffer name created in case helm is used."
            direction
            (or (veri-kompass--module-name-at-point-safe) "<unknown>")))
 
+(defsubst veri-kompass-forward-balanced ()
+  "After an opening parenthesys find the matching closing one."
+  (save-match-data
+    (let ((x 1))
+      (while (and (> x 0)
+                  (re-search-forward "\\((\\|)\\)" nil t))
+        (if (equal (match-string 0) "(")
+            (setq x (1+ x))
+          (setq x (1- x)))))))
+
 (defun veri-kompass--search-submodule-port-drivers (sym)
   "Return submodule port connection candidates for SYM."
   (let ((res ()))
@@ -288,10 +300,196 @@ BUFF-NAME is the buffer name created in case helm is used."
   (when (re-search-forward
          (concat "\\."
                  (regexp-quote port-name)
-                 "[[:space:]\n]*([[:space:]\n]*\\([0-9a-z_]+\\)")
+                 "[[:space:]\n]*([[:space:]\n]*\\("
+                 veri-kompass-ident-regex
+                 "\\)")
          nil t)
     (cons (match-string-no-properties 1)
           (match-beginning 1))))
+
+(defun veri-kompass--skip-parameter-override ()
+  "Skip a parameter override at point, returning non-nil if one was skipped."
+  (when (looking-at veri-kompass-parameter-start-regexp)
+    (goto-char (match-end 0))
+    (veri-kompass-forward-balanced)
+    t))
+
+(defun veri-kompass--submodule-instances-in-current-module ()
+  "Return submodule instance records found in the current restriction."
+  (let ((instances nil))
+    (goto-char (point-min))
+    (while (re-search-forward
+            (concat "\\<\\(" veri-kompass-ident-regex "\\)\\>")
+            nil t)
+      (let ((mod-name (match-string-no-properties 1)))
+        (unless (or (char-equal (aref mod-name 0) ?\`)
+                    (veri-kompass--ignored-inst-token-p mod-name))
+          (save-excursion
+            (skip-chars-forward " \t\n")
+            (veri-kompass--skip-parameter-override)
+            (skip-chars-forward " \t\n")
+            (when (looking-at
+                   (concat "\\(" veri-kompass-ident-regex "\\)[[:space:]\n]*("))
+              (let ((inst-name (match-string-no-properties 1))
+                    (args-start (match-end 0)))
+                (unless (veri-kompass--ignored-inst-token-p inst-name)
+                  (goto-char args-start)
+                  (veri-kompass-forward-balanced)
+                  (when (looking-at "[[:space:]\n]*;")
+                    (push (list :mod mod-name
+                                :inst inst-name
+                                :start args-start
+                                :end (1- (point)))
+                          instances)))))))))
+    (nreverse instances)))
+
+(defun veri-kompass--simple-port-connections (sym instance)
+  "Return simple named port connections to SYM inside INSTANCE."
+  (let ((connections nil)
+        (regexp (concat "\\.\\(" veri-kompass-ident-regex "\\)"
+                        "[[:space:]\n]*([[:space:]\n]*\\("
+                        (regexp-quote sym)
+                        "\\)\\(?:[[:space:]]*\\[[^]]+\\]\\)?"
+                        "[[:space:]\n]*)")))
+    (save-excursion
+      (goto-char (plist-get instance :start))
+      (while (re-search-forward regexp (plist-get instance :end) t)
+        (push (list :port (match-string-no-properties 1)
+                    :signal (match-string-no-properties 2)
+                    :pos (match-beginning 2))
+              connections)))
+    (nreverse connections)))
+
+(defun veri-kompass--module-restriction (mod-name)
+  "Return (BUFFER START END) for MOD-NAME, or nil if the module is unknown."
+  (let ((coords (veri-kompass-mod-to-file-name-pos mod-name)))
+    (when coords
+      (let ((buffer (find-file-noselect (car coords))))
+        (with-current-buffer buffer
+          (save-excursion
+            (save-restriction
+              (widen)
+              (goto-char (cadr coords))
+              (let ((start (point)))
+                (when (re-search-forward veri-kompass-module-end-regexp nil t)
+                  (list buffer start (point)))))))))))
+
+(defun veri-kompass--port-direction-in-module (mod-name port-name)
+  "Return the direction symbol for PORT-NAME in MOD-NAME."
+  (let ((restriction (veri-kompass--module-restriction mod-name))
+        (direction nil))
+    (when restriction
+      (with-current-buffer (nth 0 restriction)
+        (save-excursion
+          (save-restriction
+            (narrow-to-region (nth 1 restriction) (nth 2 restriction))
+            (cond
+             ((veri-kompass--port-declarations 'input port-name)
+              (setq direction 'input))
+             ((veri-kompass--port-declarations 'inout port-name)
+              (setq direction 'inout))
+             ((veri-kompass--port-declarations 'output port-name)
+              (setq direction 'output)))))))
+    direction))
+
+(defun veri-kompass--candidate-at-point (direction label reason)
+  "Return a trace candidate at point with DIRECTION, LABEL, and REASON."
+  (make-veri-kompass-trace-candidate
+   :direction direction
+   :label label
+   :marker (copy-marker (point))
+   :file (buffer-file-name)
+   :line (line-number-at-pos)
+   :snippet (veri-kompass--line-snippet)
+   :reason reason))
+
+(defun veri-kompass--child-load-candidates (sym instance connection)
+  "Return child module load candidates for SYM through INSTANCE CONNECTION."
+  (let* ((mod-name (plist-get instance :mod))
+         (inst-name (plist-get instance :inst))
+         (port-name (plist-get connection :port))
+         (direction (veri-kompass--port-direction-in-module mod-name port-name))
+         (restriction (veri-kompass--module-restriction mod-name))
+         (label (format "%s.%s" inst-name port-name))
+         (renamed (not (equal sym port-name)))
+         (reason (format "%s child %s%s"
+                         (symbol-name direction)
+                         label
+                         (if renamed " (renamed boundary)" "")))
+         (candidates nil))
+    (when (and restriction (memq direction '(input inout)))
+      (with-current-buffer (nth 0 restriction)
+        (save-excursion
+          (save-restriction
+            (narrow-to-region (nth 1 restriction) (nth 2 restriction))
+            (dolist (load (veri-kompass--search-local-loads port-name))
+              (goto-char (cdr load))
+              (push (veri-kompass--candidate-at-point 'load label reason)
+                    candidates))
+            (unless candidates
+              (let ((ports (veri-kompass--port-declarations direction port-name)))
+                (when ports
+                  (goto-char (cdar ports))
+                  (push (veri-kompass--candidate-at-point 'load label reason)
+                        candidates))))))))
+    (nreverse candidates)))
+
+(defun veri-kompass--search-submodule-port-loads (sym)
+  "Return child module load candidates for simple connections to SYM."
+  (let ((loads nil))
+    (dolist (instance (veri-kompass--submodule-instances-in-current-module))
+      (dolist (connection (veri-kompass--simple-port-connections sym instance))
+        (setq loads
+              (append loads
+                      (veri-kompass--child-load-candidates
+                       sym instance connection)))))
+    loads))
+
+(defun veri-kompass--submodule-output-connection-positions (sym)
+  "Return positions where SYM is connected to child output ports."
+  (let ((positions nil))
+    (dolist (instance (veri-kompass--submodule-instances-in-current-module))
+      (dolist (connection (veri-kompass--simple-port-connections sym instance))
+        (when (eq (veri-kompass--port-direction-in-module
+                   (plist-get instance :mod)
+                   (plist-get connection :port))
+                  'output)
+          (push (plist-get connection :pos) positions))))
+    positions))
+
+(defun veri-kompass--declaration-positions (sym)
+  "Return declaration positions for SYM in the current restriction."
+  (let ((positions nil))
+    (dolist (kind '("input" "output" "inout" "wire" "reg" "logic"))
+      (goto-char (point-min))
+      (while (re-search-forward
+              (concat
+               "\\<" kind "\\>"
+               "\\(?:[[:space:]]+\\(?:wire\\|reg\\|logic\\|signed\\|unsigned\\)\\)*"
+               "\\(?:[[:space:]]+\\[[^]]+\\]\\)?"
+               "[[:space:]]+\\("
+               (regexp-quote sym)
+               "\\)")
+              nil t)
+        (push (match-beginning 1) positions)))
+    positions))
+
+(defun veri-kompass--search-local-loads (sym)
+  "Return loads for SYM in the current restriction only."
+  (let ((loads nil)
+        (drivers (mapcar #'cdr (veri-kompass-search-driver sym 'internal)))
+        (output-connections
+         (veri-kompass--submodule-output-connection-positions sym))
+        (declarations (veri-kompass--declaration-positions sym)))
+    (goto-char (point-max))
+    (while (re-search-backward (concat "^.*\\(\\<" sym "\\>\\).*") nil t)
+      (let ((pos (match-beginning 1)))
+        (unless (or (member pos drivers)
+                    (member pos output-connections)
+                    (member pos declarations))
+          (push (cons (match-string 0) pos)
+                loads))))
+    loads))
 
 (defun veri-kompass-search-driver (sym &optional internal)
   "Given the symbol SYM search for it's driver.
@@ -373,17 +571,47 @@ Return `same', `renamed', `no-parent', or nil."
     (re-search-backward veri-kompass-module-start-regexp)
     (match-string-no-properties 1)))
 
+(defun veri-kompass--go-up-output-loads-from-point (signal-name)
+  "Return parent loads for output SIGNAL-NAME at point.
+Return `no-parent' if the current hierarchy mark cannot move upward."
+  (if veri-kompass-curr-select
+      (let* ((curr-mark (veri-kompass-curr-mark))
+             (mark-mod (car curr-mark))
+             (mark-inst (cdr curr-mark))
+             (module-name (veri-kompass-module-name-at-point)))
+        (if (not (equal module-name mark-mod))
+            (progn
+              (message "Marked module is different from current one.")
+              nil)
+          (set-buffer (veri-kompass-go-up 'jump))
+          (search-forward mark-inst nil t)
+          (let ((connection
+                 (veri-kompass--parent-port-signal-at-point signal-name)))
+            (if (not connection)
+                nil
+              (let ((parent-signal (car connection))
+                    (parent-pos (cdr connection)))
+                (goto-char parent-pos)
+                (veri-kompass-within-current-module
+                 (mapcar
+                  (lambda (load)
+                    (goto-char (cdr load))
+                    (veri-kompass--candidate-at-point
+                     'load
+                     parent-signal
+                     (format "parent output %s%s"
+                             signal-name
+                             (if (equal signal-name parent-signal)
+                                 ""
+                               (format " -> %s" parent-signal)))))
+                  (veri-kompass-search-load parent-signal))))))))
+    'no-parent))
+
 (defun veri-kompass-search-load (sym)
   "Given the simbol SYM search for all its loads."
   (save-excursion
-    (let ((loads ())
-          (drivers (mapcar #'cdr (veri-kompass-search-driver sym 'internal))))
-      (goto-char (point-max))
-      (while (re-search-backward (concat "^.*\\(\\<" sym "\\>\\).*") nil t)
-        (unless (member (match-beginning 1) drivers)
-          (push (cons (match-string 0) (match-beginning 1))
-                loads)))
-      loads)))
+    (append (veri-kompass--search-local-loads sym)
+            (veri-kompass--search-submodule-port-loads sym))))
 
 (defvar-local veri-kompass-load-select--origin-window nil
   "Window that displayed the source buffer when load selection started.")
@@ -676,21 +904,38 @@ DIRECTION should be positive to move down or negative to move up."
 (defun veri-kompass-search-load-at-point ()
   "Goto the loads for symbol at point."
   (interactive)
-  (veri-kompass-within-current-module
-   (let* ((sym (car (veri-kompass-sym-at-point)))
-          (res (unless (veri-kompass--point-on-port-declaration-p 'output sym)
-                 (veri-kompass-search-load sym))))
-     (cond
-      (res
-       (if (equal (length res) 1)
-           (progn
-             (veri-kompass-trace-history--record-jump)
-             (goto-char (cdar res)))
-         (veri-kompass--show-load-selection res)))
-      ((veri-kompass--output-port-p sym)
-       (veri-kompass--message-port-boundary sym "output"))
-      (t
-       (message "Cannot find load for %s" sym))))))
+  (let ((origin-buffer (current-buffer))
+        (origin-marker (copy-marker (point)))
+        (res nil)
+        (output-port nil)
+        (parent-search nil)
+        (sym nil))
+    (veri-kompass-within-current-module
+     (setq sym (car (veri-kompass-sym-at-point)))
+     (setq output-port
+           (veri-kompass--point-on-port-declaration-p 'output sym))
+     (setq res
+           (if output-port
+               (progn
+                 (setq parent-search t)
+                 (veri-kompass--go-up-output-loads-from-point sym))
+             (veri-kompass-search-load sym))))
+    (when parent-search
+      (switch-to-buffer origin-buffer)
+      (goto-char origin-marker))
+    (cond
+     ((and res (not (eq res 'no-parent)))
+      (if (equal (length res) 1)
+          (progn
+            (if parent-search
+                (veri-kompass-trace-history--record-entry origin-marker)
+              (veri-kompass-trace-history--record-jump))
+            (veri-kompass--goto-candidate (car res) origin-buffer))
+        (veri-kompass--show-load-selection res)))
+     (output-port
+      (veri-kompass--message-port-boundary sym "output"))
+     (t
+      (message "Cannot find load for %s" sym)))))
 
 (defun veri-kompass-follow-from-point ()
   "Follow symbol at point.
@@ -880,16 +1125,6 @@ SOURCE can be a directory or a file list."
                            (1+ nest)
                          (1- nest)))))
         (put-text-property (mark) (point) 'code t)))))
-
-(defsubst veri-kompass-forward-balanced ()
-  "After an opening parenthesys find the matching closing one."
-  (save-match-data
-    (let ((x 1))
-      (while (and (> x 0)
-                  (re-search-forward "\\((\\|)\\)" nil t))
-        (if (equal (match-string 0) "(")
-            (setq x (1+ x))
-          (setq x (1- x)))))))
 
 (defsubst veri-kompass-delete-parameters ()
   "Remove all #( ... )."
@@ -1255,6 +1490,24 @@ The decendent parsing will start from module TOP-NAME."
        ,@body
        captured-message)))
 
+(defmacro veri-kompass-test-with-verilog-file (content &rest body)
+  "Create a temporary Verilog file containing CONTENT and execute BODY."
+  `(let ((tmp-file (make-temp-file "veri-kompass-design" nil ".v"))
+         (buffer nil))
+     (unwind-protect
+         (progn
+           (with-temp-file tmp-file
+             (insert ,content))
+           (setq veri-kompass-module-list
+                 (veri-kompass-list-modules-in-file tmp-file))
+           (setq buffer (find-file-noselect tmp-file))
+           (with-current-buffer buffer
+             ,@body))
+       (when (buffer-live-p buffer)
+         (kill-buffer buffer))
+       (when (file-exists-p tmp-file)
+         (delete-file tmp-file)))))
+
 (when (featurep 'ert)
   (ert-deftest veri-kompass-test-filelist-parsing ()
     "Ensure filelists are parsed as absolute filtered paths."
@@ -1452,7 +1705,12 @@ The decendent parsing will start from module TOP-NAME."
         (should (looking-at "clk")))
       (goto-char (point-min))
       (should (equal (car (veri-kompass--parent-port-signal-at-point "rst"))
-                     "parent_rst"))))
+                     "parent_rst"))
+      (goto-char (point-min))
+      (insert "  .DATA_OUT(Parent_SIG)\n")
+      (goto-char (point-min))
+      (should (equal (car (veri-kompass--parent-port-signal-at-point "DATA_OUT"))
+                     "Parent_SIG"))))
   (ert-deftest veri-kompass-test-trace-candidate-display ()
     "Ensure structured trace candidates render useful result lines."
     (with-temp-buffer
@@ -1499,6 +1757,129 @@ The decendent parsing will start from module TOP-NAME."
         (should (string-match-p
                  "Signal out is an output port of module top"
                  msg)))))
+  (ert-deftest veri-kompass-test-load-output-port-goes-up-to-parent-load ()
+    "Ensure child output port load tracing follows the parent connection."
+    (let ((veri-kompass-curr-select nil)
+          (veri-kompass-history nil))
+      (veri-kompass-test-with-verilog-file
+       (concat
+        "module child(output DATA_OUT);\n"
+        "assign DATA_OUT = 1'b1;\n"
+        "endmodule\n"
+        "module top;\n"
+        "wire Parent_SIG;\n"
+        "child u_child (.DATA_OUT(Parent_SIG));\n"
+        "assign sink = Parent_SIG;\n"
+        "endmodule\n")
+       (save-window-excursion
+         (delete-other-windows)
+         (let ((bar (get-buffer-create veri-kompass-bar-name)))
+           (setq veri-kompass-mod-str-hash (make-hash-table :test 'equal))
+           (setq veri-kompass-hier (veri-kompass-build-hier "top"))
+           (switch-to-buffer bar)
+           (let ((inhibit-read-only t))
+             (erase-buffer)
+             (insert (veri-kompass-orgify-hier veri-kompass-hier 1)))
+           (veri-kompass-mode)
+           (goto-char (point-min))
+           (search-forward "u_child")
+           (veri-kompass-mark-and-jump)
+           (let ((coords (veri-kompass-mod-to-file-name-pos "child")))
+             (switch-to-buffer (find-file-noselect (car coords)))
+             (goto-char (cadr coords)))
+           (search-forward "output ")
+           (search-forward "DATA_OUT")
+           (veri-kompass-search-load-at-point)
+           (should (string-match-p "module top" (buffer-string)))
+           (should (looking-at "Parent_SIG"))
+            (should (string-match-p
+                     "assign sink = Parent_SIG"
+                     (veri-kompass--line-snippet))))))))
+  (ert-deftest veri-kompass-test-load-crosses-child-input-port ()
+    "Ensure load tracing follows a parent signal into a child input."
+    (veri-kompass-test-with-verilog-file
+     (concat
+      "module child(input clk, output out);\n"
+      "assign out = clk;\n"
+      "endmodule\n"
+      "module top(input clk);\n"
+      "child u_child (.clk(clk), .out());\n"
+      "endmodule\n")
+     (goto-char (point-min))
+     (search-forward "module top")
+     (let* ((loads (veri-kompass-within-current-module
+                    (veri-kompass-search-load "clk")))
+            (child-load (cl-find-if #'veri-kompass-trace-candidate-p loads)))
+       (should child-load)
+       (should (equal (veri-kompass-trace-candidate-label child-load)
+                      "u_child.clk"))
+       (should (string-match-p
+                "input child u_child.clk"
+                (veri-kompass-trace-candidate-reason child-load)))
+       (with-current-buffer (marker-buffer
+                             (veri-kompass-trace-candidate-marker child-load))
+         (goto-char (veri-kompass-trace-candidate-marker child-load))
+         (should (looking-at "clk"))))))
+  (ert-deftest veri-kompass-test-load-ignores-child-output-port ()
+    "Ensure child output connections are not treated as loads."
+    (veri-kompass-test-with-verilog-file
+     (concat
+      "module child(output out);\n"
+      "assign out = 1'b1;\n"
+      "endmodule\n"
+      "module top;\n"
+      "child u_child (.out(foo));\n"
+      "endmodule\n")
+     (goto-char (point-min))
+     (search-forward "module top")
+     (let ((loads (veri-kompass-within-current-module
+                   (veri-kompass-search-load "foo"))))
+       (should (null loads)))))
+  (ert-deftest veri-kompass-test-load-crosses-renamed-child-input-port ()
+    "Ensure renamed child input connections can be traced as loads."
+    (veri-kompass-test-with-verilog-file
+     (concat
+      "module child(input child_clk, output out);\n"
+      "assign out = child_clk;\n"
+      "endmodule\n"
+      "module top(input clk);\n"
+      "child u_child (.child_clk(clk), .out());\n"
+      "endmodule\n")
+     (goto-char (point-min))
+     (search-forward "module top")
+     (let* ((loads (veri-kompass-within-current-module
+                    (veri-kompass-search-load "clk")))
+            (child-load (cl-find-if #'veri-kompass-trace-candidate-p loads)))
+       (should child-load)
+       (should (equal (veri-kompass-trace-candidate-label child-load)
+                      "u_child.child_clk"))
+       (should (string-match-p
+                "renamed boundary"
+                (veri-kompass-trace-candidate-reason child-load))))))
+  (ert-deftest veri-kompass-test-load-multiple-child-input-fanout ()
+    "Ensure multiple child input loads produce multiple trace candidates."
+    (veri-kompass-test-with-verilog-file
+     (concat
+      "module child(input din, output out);\n"
+      "assign out = din;\n"
+      "endmodule\n"
+      "module top(input foo);\n"
+      "child u_a (.din(foo), .out());\n"
+      "child u_b (.din(foo), .out());\n"
+      "endmodule\n")
+     (goto-char (point-min))
+     (search-forward "module top")
+     (let* ((loads (veri-kompass-within-current-module
+                    (veri-kompass-search-load "foo")))
+            (child-loads (cl-remove-if-not
+                          #'veri-kompass-trace-candidate-p loads)))
+       (should (= (length child-loads) 2))
+       (should (cl-find "u_a.din" child-loads
+                        :key #'veri-kompass-trace-candidate-label
+                        :test #'equal))
+       (should (cl-find "u_b.din" child-loads
+                        :key #'veri-kompass-trace-candidate-label
+                        :test #'equal)))))
   (ert-deftest veri-kompass-test-trace-selection-legacy-preview-and-commit ()
     "Ensure legacy candidates preview and commit to their source positions."
     (with-temp-buffer

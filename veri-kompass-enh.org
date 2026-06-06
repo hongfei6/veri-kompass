@@ -199,3 +199,18 @@
   - 真实 =src/rtl.f= + =TOP= hierarchy 中，从 =TOP_controller.v:56= 按 =C-c l= 可进入候选框，首个实际 load 为 =src/TOP/TOP.v:2019=。
   - =emacs -Q --batch -L veri-kompass -l veri-kompass/veri-kompass.el -f ert-run-tests-batch-and-exit= 通过，27/27。
   - =emacs -Q --batch -L veri-kompass -f batch-byte-compile veri-kompass/veri-kompass.el= 通过；剩余 warning 仍为既有 docstring/可选 Helm/ERT runtime warning。
+- 需求更新：追踪信号时增加容易识别的目标标记，优先实现临时高亮信号名本身。
+- 已实现：
+  - 新增 =veri-kompass-trace-highlight-face= 和全局 trace highlight overlay。
+  - 新增 =veri-kompass-highlight-trace-target=，在 marker 附近按 Verilog identifier 识别并只高亮信号 token。
+  - 新增 =veri-kompass-clear-trace-highlight=，可手动清除当前 trace 高亮。
+  - 单候选 driver/load 跳转、候选框 =C-j= / =C-k= 预览、=RET= 提交、trace history =C-c b= / =C-c f= 跳转都会更新高亮。
+  - 每次新 trace 高亮会替换旧 overlay，避免长期残留多处标记。
+- 新增 ERT 覆盖：
+  - =veri-kompass-test-trace-highlight-direct-jump=
+  - =veri-kompass-test-trace-highlight-selection-preview=
+  - =veri-kompass-test-trace-highlight-history-navigation=
+  - =veri-kompass-test-trace-highlight-dead-marker-noop=
+- 验证结果：
+  - =emacs -Q --batch -L veri-kompass -l veri-kompass/veri-kompass.el -f ert-run-tests-batch-and-exit= 通过，30/30。
+  - =emacs -Q --batch -L veri-kompass -f batch-byte-compile veri-kompass/veri-kompass.el= 通过；剩余 warning 仍为既有 docstring/可选 Helm/ERT runtime warning。

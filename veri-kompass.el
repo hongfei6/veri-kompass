@@ -82,6 +82,11 @@
   "Face for marking instance selected."
   :group 'veri-kompass)
 
+(defface veri-kompass-trace-highlight-face
+  '((t :inherit highlight :weight bold))
+  "Face for the current trace target signal."
+  :group 'veri-kompass)
+
 (defvar veri-kompass-module-list nil)
 
 (defvar veri-kompass-module-hier nil)
@@ -139,6 +144,9 @@
 
 (defvar veri-kompass-trace-history--in-navigation nil
   "Non-nil while trace history navigation is moving point.")
+
+(defvar veri-kompass-trace-highlight-overlay nil
+  "Overlay highlighting the current trace target signal.")
 
 (cl-defstruct (veri-kompass-mod-inst (:copier nil))
   "Holds a module instantiations."
@@ -554,7 +562,8 @@ Return `same', `renamed', `no-parent', or nil."
        (message "Cannot find driver for %s" sym))
       ((equal (length res) 1)
        (veri-kompass-trace-history--record-jump)
-       (goto-char (cdar res)))
+       (goto-char (cdar res))
+       (veri-kompass-highlight-trace-target))
       (t
        (veri-kompass--show-trace-selection res "Select driver line"))))))
 
@@ -651,8 +660,48 @@ Return `no-parent' if the current hierarchy mark cannot move upward."
                        (when line (format "line %s" line))
                        reason
                        snippet))
-         " | "))
+          " | "))
     (car candidate)))
+
+(defun veri-kompass-clear-trace-highlight ()
+  "Clear the current trace target highlight."
+  (interactive)
+  (when (overlayp veri-kompass-trace-highlight-overlay)
+    (delete-overlay veri-kompass-trace-highlight-overlay))
+  (setq veri-kompass-trace-highlight-overlay nil))
+
+(defun veri-kompass--trace-token-bounds-at-point ()
+  "Return bounds of the Verilog identifier around point."
+  (let ((pos (point))
+        (chars "a-zA-Z0-9_$"))
+    (save-excursion
+      (skip-chars-backward chars)
+      (when (looking-at veri-kompass-ident-regex)
+        (let ((start (match-beginning 0))
+              (end (match-end 0)))
+          (when (and (<= start pos)
+                     (<= pos end))
+            (cons start end)))))))
+
+(defun veri-kompass-highlight-trace-target (&optional marker)
+  "Highlight the trace target signal at MARKER or point."
+  (let ((target (or marker (copy-marker (point)))))
+    (when (and (markerp target)
+               (buffer-live-p (marker-buffer target)))
+      (veri-kompass-clear-trace-highlight)
+      (with-current-buffer (marker-buffer target)
+        (save-excursion
+          (goto-char target)
+          (let ((bounds (veri-kompass--trace-token-bounds-at-point)))
+            (when bounds
+              (setq veri-kompass-trace-highlight-overlay
+                    (make-overlay (car bounds) (cdr bounds) (current-buffer)
+                                  nil t))
+              (overlay-put veri-kompass-trace-highlight-overlay
+                           'face 'veri-kompass-trace-highlight-face)
+              (overlay-put veri-kompass-trace-highlight-overlay
+                           'priority 1000)
+              veri-kompass-trace-highlight-overlay)))))))
 
 (defun veri-kompass-trace-history--make-marker ()
   "Return a marker for the current buffer and point."
@@ -713,6 +762,7 @@ Return `no-parent' if the current hierarchy mark cannot move upward."
     (let ((buffer (marker-buffer entry)))
       (switch-to-buffer buffer)
       (goto-char entry)
+      (veri-kompass-highlight-trace-target entry)
       t)))
 
 (defun veri-kompass-trace-back ()
@@ -754,6 +804,7 @@ Return `no-parent' if the current hierarchy mark cannot move upward."
                (buffer-live-p (marker-buffer marker)))
       (switch-to-buffer (marker-buffer marker))
       (goto-char marker)
+      (veri-kompass-highlight-trace-target marker)
       t)))
 
 (defun veri-kompass-load-select--current-marker ()
@@ -804,6 +855,7 @@ DIRECTION should be positive to move down or negative to move up."
         (setq veri-kompass-load-select--origin-window target-window)
         (with-selected-window target-window
           (goto-char marker)
+          (veri-kompass-highlight-trace-target marker)
           (recenter))
         target-window))))
 
@@ -1726,6 +1778,50 @@ The decendent parsing will start from module TOP-NAME."
                                 (veri-kompass--candidate-display candidate)))
         (should (string-match-p "same-name parent"
                                 (veri-kompass--candidate-display candidate))))))
+  (ert-deftest veri-kompass-test-trace-highlight-direct-jump ()
+    "Ensure direct trace jumps highlight the target signal."
+    (let ((veri-kompass-trace-highlight-overlay nil)
+          (veri-kompass-trace-back-stack nil))
+      (with-temp-buffer
+        (insert "module child;\n")
+        (insert "assign foo = bar;\n")
+        (insert "assign sink = foo;\n")
+        (insert "endmodule\n")
+        (insert "endmodule\n")
+        (goto-char (point-min))
+        (search-forward "sink = foo")
+        (veri-kompass--search-driver-at-point-rec "foo" 32)
+        (should (overlayp veri-kompass-trace-highlight-overlay))
+        (should (equal (buffer-substring-no-properties
+                        (overlay-start veri-kompass-trace-highlight-overlay)
+                        (overlay-end veri-kompass-trace-highlight-overlay))
+                       "foo")))))
+  (ert-deftest veri-kompass-test-trace-highlight-selection-preview ()
+    "Ensure selection preview moves the trace highlight."
+    (let ((veri-kompass-trace-highlight-overlay nil))
+      (with-temp-buffer
+        (insert "assign foo = bar;\n")
+        (let ((first (point-min))
+              (second nil))
+          (goto-char (point-max))
+          (setq second (point))
+          (insert "assign foo = baz;\n")
+          (save-window-excursion
+            (delete-other-windows)
+            (let ((origin-window (selected-window)))
+              (set-window-buffer origin-window (current-buffer))
+              (veri-kompass--show-trace-selection
+               (list (cons "assign foo = bar;" first)
+                     (cons "assign foo = baz;" second))
+               "Select driver line")
+              (should (overlayp veri-kompass-trace-highlight-overlay))
+              (should (= (overlay-start veri-kompass-trace-highlight-overlay)
+                         first))
+              (select-window (get-buffer-window veri-kompass-load-select-buffer-name))
+              (with-current-buffer veri-kompass-load-select-buffer-name
+                (veri-kompass-load-select-next))
+              (should (= (overlay-start veri-kompass-trace-highlight-overlay)
+                         second)))))))
   (ert-deftest veri-kompass-test-load-select-preview ()
     "Ensure moving across load entries previews the source location."
     (with-temp-buffer
@@ -1923,6 +2019,27 @@ The decendent parsing will start from module TOP-NAME."
           (should (= (length veri-kompass-trace-forward-stack) 1))
           (veri-kompass-trace-forward)
           (should (looking-at "foo = bar"))))))
+  (ert-deftest veri-kompass-test-trace-highlight-history-navigation ()
+    "Ensure trace history navigation highlights the target signal."
+    (let ((veri-kompass-trace-back-stack nil)
+          (veri-kompass-trace-forward-stack nil)
+          (veri-kompass-trace-highlight-overlay nil))
+      (with-temp-buffer
+        (insert "module child;\n")
+        (insert "assign foo = bar;\n")
+        (insert "assign sink = foo;\n")
+        (insert "endmodule\n")
+        (goto-char (point-min))
+        (search-forward "sink = foo")
+        (let ((origin (point)))
+          (veri-kompass--search-driver-at-point-rec "foo" 32)
+          (veri-kompass-trace-back)
+          (should (= (point) origin))
+          (should (overlayp veri-kompass-trace-highlight-overlay))
+          (should (equal (buffer-substring-no-properties
+                          (overlay-start veri-kompass-trace-highlight-overlay)
+                          (overlay-end veri-kompass-trace-highlight-overlay))
+                         "foo"))))))
   (ert-deftest veri-kompass-test-trace-history-new-jump-clears-forward ()
     "Ensure a new trace jump clears forward history."
     (let ((veri-kompass-trace-back-stack nil)
@@ -2006,6 +2123,19 @@ The decendent parsing will start from module TOP-NAME."
                "Trace forward history is empty"
                (veri-kompass-test-with-captured-message
                 (veri-kompass-trace-forward))))))
+  (ert-deftest veri-kompass-test-trace-highlight-dead-marker-noop ()
+    "Ensure dead markers do not create trace highlights."
+    (let ((veri-kompass-trace-highlight-overlay nil)
+          (dead-buffer (generate-new-buffer " *veri-kompass-highlight-dead*"))
+          (marker nil))
+      (with-current-buffer dead-buffer
+        (insert "foo")
+        (goto-char (point-min))
+        (setq marker (copy-marker (point))))
+      (kill-buffer dead-buffer)
+      (veri-kompass-highlight-trace-target marker)
+      (should (null veri-kompass-trace-highlight-overlay))))
+  )
 
 (provide 'veri-kompass)
 

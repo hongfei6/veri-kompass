@@ -51,6 +51,8 @@ Features:
   renamed named-port connections such as `.child_clk(clk)`.
 - Keep trace jump history for confirmed driver/load jumps, with `C-c b` and
   `C-c f` for back/forward navigation.
+- Highlight the current trace target signal during preview, jump, and trace
+  history navigation.
 - Report hierarchy warnings when an instantiated module cannot be found,
   instead of silently omitting it from the hierarchy view.
 

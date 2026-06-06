@@ -72,6 +72,11 @@
   :type 'string
   :group 'veri-kompass)
 
+(defcustom veri-kompass-trace-history-limit 100
+  "Maximum number of trace jumps kept in history."
+  :type 'integer
+  :group 'veri-kompass)
+
 (defface veri-kompass-inst-marked-face
   '((t :foreground "red1"))
   "Face for marking instance selected."
@@ -123,6 +128,15 @@
 
 (defvar veri-kompass-history nil
   "Holds the instance selection history.")
+
+(defvar veri-kompass-trace-back-stack nil
+  "Trace jump back history.")
+
+(defvar veri-kompass-trace-forward-stack nil
+  "Trace jump forward history.")
+
+(defvar veri-kompass-trace-history--in-navigation nil
+  "Non-nil while trace history navigation is moving point.")
 
 (cl-defstruct (veri-kompass-mod-inst (:copier nil))
   "Holds a module instantiations."
@@ -307,15 +321,16 @@ Return `same', `renamed', `no-parent', or nil."
             (progn
               (message "Marked module is different from current one.")
               nil)
+          (veri-kompass-trace-history--record-jump)
           (set-buffer (veri-kompass-go-up 'jump))
           (search-forward mark-inst nil t)
           (let ((connection (veri-kompass--parent-port-signal-at-point signal-name)))
             (when connection
               (let ((parent-signal (car connection))
                     (parent-pos (cdr connection)))
-              (goto-char parent-pos)
-              (if (equal parent-signal signal-name)
-                  'same
+               (goto-char parent-pos)
+               (if (equal parent-signal signal-name)
+                   'same
                 (message "Signal %s is renamed to %s at parent boundary."
                          signal-name parent-signal)
                 'renamed))))))
@@ -340,6 +355,7 @@ Return `same', `renamed', `no-parent', or nil."
       ((null res)
        (message "Cannot find driver for %s" sym))
       ((equal (length res) 1)
+       (veri-kompass-trace-history--record-jump)
        (goto-char (cdar res)))
       (t
        (veri-kompass--show-trace-selection res "Select driver line"))))))
@@ -371,6 +387,9 @@ Return `same', `renamed', `no-parent', or nil."
 
 (defvar-local veri-kompass-load-select--origin-window nil
   "Window that displayed the source buffer when load selection started.")
+
+(defvar-local veri-kompass-load-select--origin-marker nil
+  "Marker for the source position before trace selection started.")
 
 (defun veri-kompass--line-snippet ()
   "Return the current line trimmed for candidate display."
@@ -406,6 +425,99 @@ Return `same', `renamed', `no-parent', or nil."
                        snippet))
          " | "))
     (car candidate)))
+
+(defun veri-kompass-trace-history--make-marker ()
+  "Return a marker for the current buffer and point."
+  (copy-marker (point)))
+
+(defun veri-kompass-trace-history--live-entry-p (entry)
+  "Return non-nil when trace history ENTRY is still valid."
+  (and (markerp entry)
+       (buffer-live-p (marker-buffer entry))))
+
+(defun veri-kompass-trace-history--trim (stack)
+  "Return STACK trimmed to `veri-kompass-trace-history-limit'."
+  (let ((limit (max 0 veri-kompass-trace-history-limit)))
+    (if (<= (length stack) limit)
+        stack
+      (cl-subseq stack 0 limit))))
+
+(defun veri-kompass-trace-history--push-back (entry)
+  "Push ENTRY onto the trace back history."
+  (when (and (> veri-kompass-trace-history-limit 0)
+             (veri-kompass-trace-history--live-entry-p entry))
+    (setq veri-kompass-trace-back-stack
+          (veri-kompass-trace-history--trim
+           (cons entry veri-kompass-trace-back-stack)))))
+
+(defun veri-kompass-trace-history--push-forward (entry)
+  "Push ENTRY onto the trace forward history."
+  (when (and (> veri-kompass-trace-history-limit 0)
+             (veri-kompass-trace-history--live-entry-p entry))
+    (setq veri-kompass-trace-forward-stack
+          (veri-kompass-trace-history--trim
+           (cons entry veri-kompass-trace-forward-stack)))))
+
+(defun veri-kompass-trace-history--record-jump ()
+  "Record the current position before a real trace jump."
+  (unless veri-kompass-trace-history--in-navigation
+    (veri-kompass-trace-history--push-back
+     (veri-kompass-trace-history--make-marker))
+    (setq veri-kompass-trace-forward-stack nil)))
+
+(defun veri-kompass-trace-history--record-entry (entry)
+  "Record trace history ENTRY before a real trace jump."
+  (unless veri-kompass-trace-history--in-navigation
+    (veri-kompass-trace-history--push-back entry)
+    (setq veri-kompass-trace-forward-stack nil)))
+
+(defun veri-kompass-trace-history--pop-live (stack)
+  "Return (ENTRY . REST) for the first live item in STACK."
+  (while (and stack
+              (not (veri-kompass-trace-history--live-entry-p (car stack))))
+    (setq stack (cdr stack)))
+  (when stack
+    (cons (car stack) (cdr stack))))
+
+(defun veri-kompass-trace-history--goto-entry (entry)
+  "Move to trace history ENTRY."
+  (when (veri-kompass-trace-history--live-entry-p entry)
+    (let ((buffer (marker-buffer entry)))
+      (switch-to-buffer buffer)
+      (goto-char entry)
+      t)))
+
+(defun veri-kompass-trace-back ()
+  "Move backward in trace jump history."
+  (interactive)
+  (let ((item (veri-kompass-trace-history--pop-live
+               veri-kompass-trace-back-stack)))
+    (if (not item)
+        (progn
+          (setq veri-kompass-trace-back-stack nil)
+          (message "Trace history is empty."))
+      (setq veri-kompass-trace-back-stack (cdr item))
+      (let ((current (veri-kompass-trace-history--make-marker))
+            (target (car item))
+            (veri-kompass-trace-history--in-navigation t))
+        (veri-kompass-trace-history--push-forward current)
+        (veri-kompass-trace-history--goto-entry target)))))
+
+(defun veri-kompass-trace-forward ()
+  "Move forward in trace jump history."
+  (interactive)
+  (let ((item (veri-kompass-trace-history--pop-live
+               veri-kompass-trace-forward-stack)))
+    (if (not item)
+        (progn
+          (setq veri-kompass-trace-forward-stack nil)
+          (message "Trace forward history is empty."))
+      (setq veri-kompass-trace-forward-stack (cdr item))
+      (let ((current (veri-kompass-trace-history--make-marker))
+            (target (car item))
+            (veri-kompass-trace-history--in-navigation t))
+        (veri-kompass-trace-history--push-back current)
+        (veri-kompass-trace-history--goto-entry target)))))
 
 (defun veri-kompass--goto-candidate (candidate origin-buffer)
   "Go to CANDIDATE in ORIGIN-BUFFER."
@@ -501,6 +613,8 @@ DIRECTION should be positive to move down or negative to move up."
     (if (not (and (markerp marker)
                   (buffer-live-p (marker-buffer marker))))
         (message "No load at current line.")
+      (veri-kompass-trace-history--record-entry
+       veri-kompass-load-select--origin-marker)
       (setq window (veri-kompass-load-select--preview-marker marker))
       (quit-window t)
       (when (window-live-p window)
@@ -536,6 +650,9 @@ DIRECTION should be positive to move down or negative to move up."
     (with-current-buffer buffer
       (veri-kompass-load-select-mode)
       (setq veri-kompass-load-select--origin-window origin-window)
+      (setq veri-kompass-load-select--origin-marker
+            (with-current-buffer origin-buffer
+              (copy-marker (point))))
       (let ((inhibit-read-only t))
         (erase-buffer)
         (insert title " (C-j/C-k to preview, RET to jump, q to quit).\n\n")
@@ -566,7 +683,9 @@ DIRECTION should be positive to move down or negative to move up."
      (cond
       (res
        (if (equal (length res) 1)
-           (goto-char (cdar res))
+           (progn
+             (veri-kompass-trace-history--record-jump)
+             (goto-char (cdar res)))
          (veri-kompass--show-load-selection res)))
       ((veri-kompass--output-port-p sym)
        (veri-kompass--message-port-boundary sym "output"))
@@ -1102,6 +1221,8 @@ The decendent parsing will start from module TOP-NAME."
   :keymap (let ((map (make-sparse-keymap)))
             (define-key map (kbd "C-c d") 'veri-kompass-search-driver-at-point)
             (define-key map (kbd "C-c l") 'veri-kompass-search-load-at-point)
+            (define-key map (kbd "C-c b") 'veri-kompass-trace-back)
+            (define-key map (kbd "C-c f") 'veri-kompass-trace-forward)
             map))
 
 (defvar veri-kompass-mode-map nil "Keymap for `veri-kompass-mode'.")
@@ -1401,6 +1522,109 @@ The decendent parsing will start from module TOP-NAME."
                 (veri-kompass-load-select-commit))
               (should (eq (selected-window) origin-window))
               (should (= (window-point origin-window) second))))))))
+  (ert-deftest veri-kompass-test-trace-history-back-and-forward ()
+    "Ensure single-candidate trace jumps can move back and forward."
+    (let ((veri-kompass-trace-back-stack nil)
+          (veri-kompass-trace-forward-stack nil))
+      (with-temp-buffer
+        (insert "module child;\n")
+        (insert "assign foo = bar;\n")
+        (insert "assign baz = foo;\n")
+        (insert "endmodule\n")
+        (goto-char (point-min))
+        (search-forward "baz = foo")
+        (let ((origin (point)))
+          (veri-kompass--search-driver-at-point-rec "foo" 32)
+          (should (= (length veri-kompass-trace-back-stack) 1))
+          (should (looking-at "foo = bar"))
+          (veri-kompass-trace-back)
+          (should (= (point) origin))
+          (should (= (length veri-kompass-trace-forward-stack) 1))
+          (veri-kompass-trace-forward)
+          (should (looking-at "foo = bar"))))))
+  (ert-deftest veri-kompass-test-trace-history-new-jump-clears-forward ()
+    "Ensure a new trace jump clears forward history."
+    (let ((veri-kompass-trace-back-stack nil)
+          (veri-kompass-trace-forward-stack nil))
+      (with-temp-buffer
+        (insert "module child;\n")
+        (insert "assign foo = bar;\n")
+        (insert "assign baz = qux;\n")
+        (insert "assign sink1 = foo;\n")
+        (insert "assign sink2 = baz;\n")
+        (insert "endmodule\n")
+        (goto-char (point-min))
+        (search-forward "sink1 = foo")
+        (veri-kompass--search-driver-at-point-rec "foo" 32)
+        (should veri-kompass-trace-back-stack)
+        (veri-kompass-trace-back)
+        (should veri-kompass-trace-forward-stack)
+        (goto-char (point-min))
+        (search-forward "sink2 = baz")
+        (veri-kompass--search-driver-at-point-rec "baz" 32)
+        (should (null veri-kompass-trace-forward-stack)))))
+  (ert-deftest veri-kompass-test-trace-selection-preview-does-not-record-history ()
+    "Ensure preview does not record history, while commit does."
+    (let ((veri-kompass-trace-back-stack nil)
+          (veri-kompass-trace-forward-stack nil))
+      (with-temp-buffer
+        (insert "module child;\n")
+        (let ((origin (point)))
+          (insert "assign foo = bar;\n")
+          (let ((second (point)))
+            (insert "assign foo = baz;\n")
+            (save-window-excursion
+              (delete-other-windows)
+              (let ((origin-window (selected-window)))
+                (set-window-buffer origin-window (current-buffer))
+                (goto-char origin)
+                (veri-kompass--show-trace-selection
+                 (list (cons "assign foo = bar;" origin)
+                       (cons "assign foo = baz;" second))
+                 "Select driver line")
+                (select-window (get-buffer-window veri-kompass-load-select-buffer-name))
+                (with-current-buffer veri-kompass-load-select-buffer-name
+                  (veri-kompass-load-select-next)
+                  (should (null veri-kompass-trace-back-stack))
+                  (veri-kompass-load-select-commit))
+                (should (= (length veri-kompass-trace-back-stack) 1)))))))))
+  (ert-deftest veri-kompass-test-trace-history-limit ()
+    "Ensure trace history limit trims oldest entries."
+    (let ((veri-kompass-trace-back-stack nil)
+          (veri-kompass-trace-history-limit 2))
+      (with-temp-buffer
+        (dotimes (_ 3)
+          (insert "x\n")
+          (veri-kompass-trace-history--record-jump))
+        (should (= (length veri-kompass-trace-back-stack) 2)))))
+  (ert-deftest veri-kompass-test-trace-history-skips-dead-marker ()
+    "Ensure dead markers are skipped during trace back."
+    (let ((veri-kompass-trace-back-stack nil)
+          (veri-kompass-trace-forward-stack nil))
+      (with-temp-buffer
+        (let ((live (copy-marker (point)))
+              (dead-buffer (generate-new-buffer " *veri-kompass-dead*")))
+          (with-current-buffer dead-buffer
+            (insert "dead")
+            (setq veri-kompass-trace-back-stack (list (copy-marker (point)))))
+          (kill-buffer dead-buffer)
+          (push live veri-kompass-trace-back-stack)
+          (setq veri-kompass-trace-back-stack (nreverse veri-kompass-trace-back-stack))
+          (veri-kompass-trace-back)
+          (should (= (point) live))
+          (should (null veri-kompass-trace-back-stack))))))
+  (ert-deftest veri-kompass-test-trace-history-empty-messages ()
+    "Ensure empty history commands only report messages."
+    (let ((veri-kompass-trace-back-stack nil)
+          (veri-kompass-trace-forward-stack nil))
+      (should (string-match-p
+               "Trace history is empty"
+               (veri-kompass-test-with-captured-message
+                (veri-kompass-trace-back))))
+      (should (string-match-p
+               "Trace forward history is empty"
+               (veri-kompass-test-with-captured-message
+                (veri-kompass-trace-forward))))))
 
 (provide 'veri-kompass)
 

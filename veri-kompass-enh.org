@@ -15,6 +15,7 @@
 - 建立更清晰的 trace candidate 表示，记录方向、位置、代码片段和追踪原因。
 - 改进 =C-c d= / =C-c l= 的多候选结果窗口，上下移动时同步预览，=RET= 确认。
 - 支持同名信号跨模块自动穿透：例如子模块 =input clk= 连接父模块 =.clk(clk)= 时，继续向父层追踪。
+- 增加 trace jump 历史：确认跳转后可回退/前进，便于 peek 后回到原学习代码。
 - 保持无外部依赖，先覆盖常见 module、port、assign、实例 named port connection。
 
 *** Phase 2: Verdi 风格但 Emacs 原生的结果体验
@@ -142,3 +143,23 @@
   - 加载通过。
   - ERT 16/16 通过。
   - byte-compile 通过；剩余 warning 仍为既有 docstring/可选 Helm/ERT runtime warning。
+- 需求更新：Phase 1 增加追踪过程历史回退/前进，用于 =C-c d= / =C-c l= peek 后快速回到原代码位置。
+- 复杂度判断：
+  - 只记录确认后的 trace jump，不接入 hierarchy 历史，避免两个导航模型互相污染。
+  - 不记录候选窗口 =C-j= / =C-k= 预览、无候选提示、顶层端口边界提示，以及回退/前进自身。
+  - 默认最多保存 100 层，超出后丢弃最旧记录；buffer 被关闭后的 marker 会自动跳过。
+- 已实现：
+  - 新增 =veri-kompass-trace-history-limit=，默认 100。
+  - 新增 =veri-kompass-trace-back= / =veri-kompass-trace-forward=，minor mode 快捷键为 =C-c b= / =C-c f=。
+  - 单候选 driver/load 跳转、候选窗口 =RET= 提交、同名跨父层追踪都会记录起点。
+  - 新 trace jump 会清空 forward stack，保持类似浏览器/Verdi 的回退语义。
+- 新增 ERT 覆盖：
+  - =veri-kompass-test-trace-history-back-and-forward=
+  - =veri-kompass-test-trace-history-new-jump-clears-forward=
+  - =veri-kompass-test-trace-selection-preview-does-not-record-history=
+  - =veri-kompass-test-trace-history-limit=
+  - =veri-kompass-test-trace-history-skips-dead-marker=
+  - =veri-kompass-test-trace-history-empty-messages=
+- 验证结果：
+  - =emacs -Q --batch -L veri-kompass -l veri-kompass/veri-kompass.el -f ert-run-tests-batch-and-exit= 通过，22/22。
+  - =emacs -Q --batch -L veri-kompass -f batch-byte-compile veri-kompass/veri-kompass.el= 通过；剩余 warning 仍为既有 docstring/可选 Helm/ERT runtime warning。

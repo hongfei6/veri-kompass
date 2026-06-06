@@ -101,3 +101,31 @@
   - 加载通过。
   - ERT 11/11 通过。
   - byte-compile 通过；剩余 warning 仍为既有 docstring/可选 Helm/ERT runtime warning。
+*** 2026-06-06
+- 真实试用发现：在 =src/PE_Cluster/PE/Processing_Element_core.v:280= 的 =next_psum_read_idx= 上按 =C-c d= 后，driver 候选框出现，但 =C-j= / =C-k= 不同步预览，=RET= 也没有跳到候选位置。
+- 根因：
+  - driver 候选构造中先调用 =veri-kompass--line-snippet= 再取 =match-beginning=。
+  - =veri-kompass--line-snippet= 内部使用 =string-trim=，会覆盖 Emacs match-data。
+  - 因此候选位置被污染成 =0=，selection buffer 里的 marker 实际指到源文件开头，预览和提交跳转都失效。
+- 已修复：
+  - direct driver、input driver、submodule port driver 三类候选都先保存 =match-beginning=，再生成 snippet。
+  - 新增 ERT：=veri-kompass-test-driver-candidate-keeps-source-position=，防止 match-data 被格式化逻辑污染。
+  - 新增 ERT：=veri-kompass-test-trace-selection-legacy-preview-and-commit=，覆盖旧式 =(text . pos)= 候选的预览和 =RET= 提交跳转。
+- 验证结果：
+  - =next_psum_read_idx= 的 driver 候选现在定位到 452、455、458、461 行。
+  - 加载通过。
+  - ERT 13/13 通过。
+  - byte-compile 通过；剩余 warning 仍为既有 docstring/可选 Helm/ERT runtime warning。
+- 真实试用发现：在 =src/PE_Cluster/PE/Processing_Element_core.v:33= 的 =mac_en= 上按 =C-c d= 提示 =Cannot find driver for mac_en=。
+- 根因：
+  - =mac_en= 是 ANSI 端口声明：=input                   mac_en=。
+  - 当前 input driver 正则只覆盖 =input wire/logic [range] sym= 这类较窄形式，未覆盖无类型但有对齐空白、=signed/unsigned=、位宽等常见 ANSI port 写法。
+- 已修复：
+  - 放宽 input port driver 正则，支持可选 =wire/reg/logic/signed/unsigned=、可选位宽和普通空白对齐。
+  - =mac_en= 现在识别为 input boundary，=C-c d= 不再报找不到 driver，而是返回 =go-up= 并尝试向父实例连接继续追踪。
+  - 新增 ERT：=veri-kompass-test-driver-ansi-input-with-spacing-goes-up=。
+- 验证结果：
+  - =mac_en= driver 搜索返回 =go-up=。
+  - 加载通过。
+  - ERT 14/14 通过。
+  - byte-compile 通过；剩余 warning 仍为既有 docstring/可选 Helm/ERT runtime warning。

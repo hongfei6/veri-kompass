@@ -193,25 +193,55 @@ BUFF-NAME is the buffer name created in case helm is used."
              sym
              "\\>\\)[[:space:]]*\\(\\[.*\\] +\\)?\\(=\\|<=\\)[^=].*")
             nil t)
-      (push (cons (veri-kompass--line-snippet)
-                  (match-beginning 0))
-            res))
+      (let ((pos (match-beginning 0)))
+        (push (cons (veri-kompass--line-snippet) pos)
+              res)))
     res))
 
 (defun veri-kompass--search-input-drivers (sym)
   "Return input port declarations for SYM in the current restriction."
+  (veri-kompass--port-declarations 'input sym))
+
+(defun veri-kompass--port-declarations (direction sym)
+  "Return port declarations for DIRECTION and SYM in the current restriction."
   (let ((res ()))
     (goto-char (point-min))
     (while (re-search-forward
             (concat
-             "input +\\(wire +\\)?\\(logic +\\)?\\(\\[[^]]+\\][[:space:]]*\\)?\\("
+             "\\<" (symbol-name direction) "\\>"
+             "\\(?:[[:space:]]+\\(?:wire\\|reg\\|logic\\|signed\\|unsigned\\)\\)*"
+             "\\(?:[[:space:]]+\\[[^]]+\\]\\)?"
+             "[[:space:]]+\\("
              sym
              "\\)")
             nil t)
-      (push (cons (veri-kompass--line-snippet)
-                  (match-beginning 4))
-            res))
+      (let ((pos (match-beginning 1)))
+        (push (cons (veri-kompass--line-snippet) pos)
+              res)))
     (nreverse res)))
+
+(defun veri-kompass--input-port-p (sym)
+  "Return non-nil when SYM is an input port in the current restriction."
+  (save-excursion
+    (veri-kompass--port-declarations 'input sym)))
+
+(defun veri-kompass--output-port-p (sym)
+  "Return non-nil when SYM is an output port in the current restriction."
+  (save-excursion
+    (veri-kompass--port-declarations 'output sym)))
+
+(defun veri-kompass--module-name-at-point-safe ()
+  "Return current module name, or nil when point is not inside a module."
+  (save-excursion
+    (when (re-search-backward veri-kompass-module-start-regexp nil t)
+      (match-string-no-properties 1))))
+
+(defun veri-kompass--message-port-boundary (sym direction)
+  "Message that SYM is a DIRECTION port boundary."
+  (message "Signal %s is a %s port of module %s; no parent/top-level boundary to continue."
+           sym
+           direction
+           (or (veri-kompass--module-name-at-point-safe) "<unknown>")))
 
 (defun veri-kompass--search-submodule-port-drivers (sym)
   "Return submodule port connection candidates for SYM."
@@ -223,9 +253,9 @@ BUFF-NAME is the buffer name created in case helm is used."
              sym
              "\\)\\(\\[.*\\][[:space:]]*\\)?)")
             nil t)
-      (push (cons (veri-kompass--line-snippet)
-                  (match-beginning 1))
-            res))
+      (let ((pos (match-beginning 1)))
+        (push (cons (veri-kompass--line-snippet) pos)
+              res)))
     res))
 
 (defun veri-kompass--parent-port-signal-at-point (port-name)
@@ -294,7 +324,7 @@ Return `same' for same-name, `renamed' for renamed, or nil on failure."
          ('renamed
           nil)
          (_
-          (veri-kompass-go-up-from-point))))
+          (veri-kompass--message-port-boundary sym "input"))))
       ((null res)
        (message "Cannot find driver for %s" sym))
       ((equal (length res) 1)
@@ -519,10 +549,17 @@ DIRECTION should be positive to move down or negative to move up."
   (interactive)
   (veri-kompass-within-current-module
    (let ((res (veri-kompass-search-load (car (veri-kompass-sym-at-point)))))
-     (when res
+     (cond
+      (res
        (if (equal (length res) 1)
            (goto-char (cdar res))
-         (veri-kompass--show-load-selection res))))))
+         (veri-kompass--show-load-selection res)))
+      ((veri-kompass--output-port-p (car (veri-kompass-sym-at-point)))
+       (veri-kompass--message-port-boundary
+        (car (veri-kompass-sym-at-point)) "output"))
+      (t
+       (message "Cannot find load for %s"
+                (car (veri-kompass-sym-at-point))))))))
 
 (defun veri-kompass-follow-from-point ()
   "Follow symbol at point.
@@ -1212,6 +1249,19 @@ The decendent parsing will start from module TOP-NAME."
       (insert "assign out = clk;\n")
       (insert "endmodule\n")
       (should (eq (veri-kompass-search-driver "clk") 'go-up))))
+  (ert-deftest veri-kompass-test-driver-ansi-input-with-spacing-goes-up ()
+    "Ensure ANSI input ports with spacing and ranges are parent-driven."
+    (with-temp-buffer
+      (insert "module child (\n")
+      (insert "  input                   mac_en,\n")
+      (insert "  input   signed  [20:0]  psum_in,\n")
+      (insert "  input logic             clk\n")
+      (insert ");\n")
+      (insert "assign foo = mac_en & clk;\n")
+      (insert "endmodule\n")
+      (should (eq (veri-kompass-search-driver "mac_en") 'go-up))
+      (should (eq (veri-kompass-search-driver "psum_in") 'go-up))
+      (should (eq (veri-kompass-search-driver "clk") 'go-up))))
   (ert-deftest veri-kompass-test-driver-direct-assignment-wins ()
     "Ensure local direct drivers are preferred over input declarations."
     (with-temp-buffer
@@ -1221,6 +1271,18 @@ The decendent parsing will start from module TOP-NAME."
       (let ((drivers (veri-kompass-search-driver "clk")))
         (should (listp drivers))
         (should (string-match-p "assign clk = root_clk" (caar drivers))))))
+  (ert-deftest veri-kompass-test-driver-candidate-keeps-source-position ()
+    "Ensure snippet formatting does not clobber driver match positions."
+    (with-temp-buffer
+      (insert "module child;\n")
+      (insert "assign foo = bar;\n")
+      (insert "assign foo = baz;\n")
+      (insert "endmodule\n")
+      (let ((drivers (veri-kompass-search-driver "foo")))
+        (should (= (length drivers) 2))
+        (should (> (cdar drivers) 1))
+        (goto-char (cdar drivers))
+        (should (looking-at "foo = bar")))))
   (ert-deftest veri-kompass-test-parent-port-signal-parser ()
     "Ensure parent port parsing distinguishes same-name and renamed nets."
     (with-temp-buffer
@@ -1268,6 +1330,29 @@ The decendent parsing will start from module TOP-NAME."
               (should (veri-kompass-load-select--preview-marker marker)))
             (should (= (window-point origin-window) marker))
             (kill-buffer select-buffer)))))))
+  (ert-deftest veri-kompass-test-trace-selection-legacy-preview-and-commit ()
+    "Ensure legacy candidates preview and commit to their source positions."
+    (with-temp-buffer
+      (insert "module child;\n")
+      (let ((first (point)))
+        (insert "assign foo = bar;\n")
+        (let ((second (point)))
+          (insert "assign foo = baz;\n")
+          (save-window-excursion
+            (delete-other-windows)
+            (let ((origin-window (selected-window)))
+              (set-window-buffer origin-window (current-buffer))
+              (veri-kompass--show-trace-selection
+               (list (cons "assign foo = bar;" first)
+                     (cons "assign foo = baz;" second))
+               "Select driver line")
+              (select-window (get-buffer-window veri-kompass-load-select-buffer-name))
+              (with-current-buffer veri-kompass-load-select-buffer-name
+                (veri-kompass-load-select-next)
+                (should (= (window-point origin-window) second))
+                (veri-kompass-load-select-commit))
+              (should (eq (selected-window) origin-window))
+              (should (= (window-point origin-window) second))))))))
 
 (provide 'veri-kompass)
 

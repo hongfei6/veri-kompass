@@ -116,7 +116,7 @@
   "Regexp matching optional SystemVerilog import clauses in a module header.")
 
 (defconst veri-kompass-module-start-regexp
-  (concat "module[[:space:]\n]+\\(" veri-kompass-ident-regex "\\)"
+  (concat "^[[:space:]]*module[[:space:]\n]+\\(" veri-kompass-ident-regex "\\)"
           veri-kompass-module-import-clause-regexp))
 
 (defconst veri-kompass-module-end-regexp "^[[:space:]]*endmodule")
@@ -200,12 +200,45 @@ BUFF-NAME is the buffer name created in case helm is used."
       (?\= 'l-val)
       (?\; 'r-val))))
 
+(defun veri-kompass--identifier-bounds-near-point ()
+  "Return bounds of the Verilog identifier nearest point."
+  (let ((origin (point))
+        (line-start (line-beginning-position))
+        (chars "a-zA-Z0-9_$"))
+    (save-excursion
+      (cond
+       ((looking-at veri-kompass-ident-regex)
+        (cons (match-beginning 0) (match-end 0)))
+       ((and (> origin line-start)
+             (save-excursion
+               (backward-char)
+               (looking-at (concat "[" chars "]"))))
+        (skip-chars-backward chars line-start)
+        (when (looking-at veri-kompass-ident-regex)
+          (cons (match-beginning 0) (match-end 0))))
+       (t
+        (skip-chars-backward " \t,;)]" line-start)
+        (when (and (> (point) line-start)
+                   (save-excursion
+                     (backward-char)
+                     (looking-at (concat "[" chars "]"))))
+          (skip-chars-backward chars line-start)
+          (when (looking-at veri-kompass-ident-regex)
+            (cons (match-beginning 0) (match-end 0)))))))))
+
 (defun veri-kompass-sym-at-point ()
   "Return an a-list containing (sym-name . 'r-val) or (sym-name . 'l-val)."
-  (save-excursion
-    (re-search-backward veri-kompass-ops-regex nil t)
-    (re-search-forward veri-kompass-sym-regex nil t)
-    (cons (match-string-no-properties 0) (veri-kompass-sym-classify-at-point))))
+  (let ((bounds (veri-kompass--identifier-bounds-near-point)))
+    (if (not bounds)
+        (save-excursion
+          (re-search-backward veri-kompass-ops-regex nil t)
+          (re-search-forward veri-kompass-sym-regex nil t)
+          (cons (match-string-no-properties 0)
+                (veri-kompass-sym-classify-at-point)))
+      (save-excursion
+        (goto-char (car bounds))
+        (cons (buffer-substring-no-properties (car bounds) (cdr bounds))
+              (veri-kompass-sym-classify-at-point))))))
 
 (defun veri-kompass--search-direct-drivers (sym)
   "Return direct assignment drivers for SYM in the current restriction."
@@ -289,19 +322,20 @@ BUFF-NAME is the buffer name created in case helm is used."
           (setq x (1- x)))))))
 
 (defun veri-kompass--search-submodule-port-drivers (sym)
-  "Return submodule port connection candidates for SYM."
-  (let ((res ()))
-    (goto-char (point-max))
-    (while (re-search-backward
-            (concat
-             "\\..+([[:space:]]*\\("
-             sym
-             "\\)\\(\\[.*\\][[:space:]]*\\)?)")
-            nil t)
-      (let ((pos (match-beginning 1)))
-        (push (cons (veri-kompass--line-snippet) pos)
-              res)))
-    res))
+  "Return submodule output/inout port connection candidates for SYM."
+  (let ((drivers nil))
+    (dolist (instance (veri-kompass--submodule-instances-in-current-module))
+      (dolist (connection (veri-kompass--simple-port-connections sym instance))
+        (let ((direction
+               (veri-kompass--port-direction-in-module
+                (plist-get instance :mod)
+                (plist-get connection :port))))
+          (when (memq direction '(output inout))
+            (setq drivers
+                  (append drivers
+                          (veri-kompass--child-driver-candidates
+                           instance connection direction)))))))
+    (nreverse drivers)))
 
 (defun veri-kompass--parent-port-signal-at-point (port-name)
   "Return (SIGNAL . POSITION) for parent connection PORT-NAME near point."
@@ -407,9 +441,40 @@ BUFF-NAME is the buffer name created in case helm is used."
    :label label
    :marker (copy-marker (point))
    :file (buffer-file-name)
-   :line (line-number-at-pos)
+   :line (line-number-at-pos (point) t)
    :snippet (veri-kompass--line-snippet)
    :reason reason))
+
+(defun veri-kompass--child-driver-candidates (instance connection direction)
+  "Return child module driver candidates through INSTANCE CONNECTION."
+  (let* ((mod-name (plist-get instance :mod))
+         (inst-name (plist-get instance :inst))
+         (port-name (plist-get connection :port))
+         (restriction (veri-kompass--module-restriction mod-name))
+         (label (format "%s.%s" inst-name port-name))
+         (reason (format "%s child output driver" (symbol-name direction)))
+         (candidates nil))
+    (when restriction
+      (with-current-buffer (nth 0 restriction)
+        (save-excursion
+          (save-restriction
+            (narrow-to-region (nth 1 restriction) (nth 2 restriction))
+            (let ((drivers (veri-kompass-search-driver port-name 'internal)))
+              (dolist (driver drivers)
+                (goto-char (if (veri-kompass-trace-candidate-p driver)
+                               (veri-kompass-trace-candidate-marker driver)
+                             (cdr driver)))
+                (push (veri-kompass--candidate-at-point 'driver label reason)
+                      candidates)))
+            (unless candidates
+              (let ((ports (or (veri-kompass--port-declarations direction port-name)
+                               (veri-kompass--port-declarations 'output port-name)
+                               (veri-kompass--port-declarations 'inout port-name))))
+                (when ports
+                  (goto-char (cdar ports))
+                  (push (veri-kompass--candidate-at-point 'driver label reason)
+                        candidates))))))))
+    (nreverse candidates)))
 
 (defun veri-kompass--child-load-candidates (sym instance connection)
   "Return child module load candidates for SYM through INSTANCE CONNECTION."
@@ -484,11 +549,15 @@ BUFF-NAME is the buffer name created in case helm is used."
 
 (defun veri-kompass--search-local-loads (sym)
   "Return loads for SYM in the current restriction only."
-  (let ((loads nil)
-        (drivers (mapcar #'cdr (veri-kompass-search-driver sym 'internal)))
-        (output-connections
-         (veri-kompass--submodule-output-connection-positions sym))
-        (declarations (veri-kompass--declaration-positions sym)))
+  (let* ((loads nil)
+         (origin-buffer (current-buffer))
+         (drivers (mapcar
+                   (lambda (driver)
+                     (veri-kompass--candidate-position driver origin-buffer))
+                   (veri-kompass-search-driver sym 'internal)))
+         (output-connections
+          (veri-kompass--submodule-output-connection-positions sym))
+         (declarations (veri-kompass--declaration-positions sym)))
     (goto-char (point-max))
     (while (re-search-backward (concat "^.*\\(\\<" sym "\\>\\).*") nil t)
       (let ((pos (match-beginning 1)))
@@ -562,8 +631,7 @@ Return `same', `renamed', `no-parent', or nil."
        (message "Cannot find driver for %s" sym))
       ((equal (length res) 1)
        (veri-kompass-trace-history--record-jump)
-       (goto-char (cdar res))
-       (veri-kompass-highlight-trace-target))
+       (veri-kompass--goto-candidate (car res) (current-buffer)))
       (t
        (veri-kompass--show-trace-selection res "Select driver line"))))))
 
@@ -644,6 +712,12 @@ Return `no-parent' if the current hierarchy mark cannot move upward."
    (t
     (with-current-buffer origin-buffer
       (copy-marker (cdr candidate))))))
+
+(defun veri-kompass--candidate-position (candidate origin-buffer)
+  "Return buffer position for CANDIDATE in ORIGIN-BUFFER."
+  (let ((marker (veri-kompass--candidate-marker candidate origin-buffer)))
+    (when (markerp marker)
+      (marker-position marker))))
 
 (defun veri-kompass--candidate-display (candidate)
   "Return display text for CANDIDATE."
@@ -1115,10 +1189,7 @@ SOURCE can be a directory or a file list."
     (insert-file-contents-literally file)
     (let ((mod-list))
       (while (re-search-forward
-              (concat "^[[:space:]]*module[[:space:]\n]+\\("
-                      veri-kompass-ident-regex
-                      "\\)"
-                      veri-kompass-module-import-clause-regexp
+              (concat veri-kompass-module-start-regexp
                       "[[:space:]]*\n*[[:space:]]*\\((\\|#[[:space:]\n]*(\\|`\\|;\\)")
               nil t)
         (push (list
@@ -1731,6 +1802,19 @@ The decendent parsing will start from module TOP-NAME."
       (let ((drivers (veri-kompass-search-driver "clk")))
         (should (listp drivers))
         (should (string-match-p "assign clk = root_clk" (caar drivers))))))
+  (ert-deftest veri-kompass-test-symbol-at-point-after-port-comma ()
+    "Ensure symbol lookup near a port comma does not return direction keywords."
+    (with-temp-buffer
+      (insert "module child;\n")
+      (insert "output                  former_data_write_fin,\n")
+      (insert "assign former_data_write_fin = done;\n")
+      (insert "endmodule\n")
+      (goto-char (point-min))
+      (search-forward "former_data_write_fin,")
+      (should (equal (car (veri-kompass-sym-at-point))
+                     "former_data_write_fin"))
+      (veri-kompass-search-driver-at-point)
+      (should (looking-at "former_data_write_fin = done"))))
   (ert-deftest veri-kompass-test-driver-candidate-keeps-source-position ()
     "Ensure snippet formatting does not clobber driver match positions."
     (with-temp-buffer
@@ -1743,6 +1827,60 @@ The decendent parsing will start from module TOP-NAME."
         (should (> (cdar drivers) 1))
         (goto-char (cdar drivers))
         (should (looking-at "foo = bar")))))
+  (ert-deftest veri-kompass-test-current-module-ignores-comment-module-text ()
+    "Ensure comments containing module do not corrupt current module parsing."
+    (with-temp-buffer
+      (insert "module real_mod;\n")
+      (insert "// PE pad module\n")
+      (insert "wire foo;\n")
+      (insert "assign sink = foo;\n")
+      (insert "endmodule\n")
+      (goto-char (point-min))
+      (search-forward "foo")
+      (should (equal (veri-kompass--module-name-at-point-safe)
+                     "real_mod"))
+      (should (equal (veri-kompass-module-name-at-point)
+                     "real_mod"))))
+  (ert-deftest veri-kompass-test-driver-crosses-child-output-port ()
+    "Ensure driver tracing follows a parent signal into a child output."
+    (veri-kompass-test-with-verilog-file
+     (concat
+      "module child(output done, input src);\n"
+      "assign done = src;\n"
+      "endmodule\n"
+      "module top(input src);\n"
+      "wire child_done;\n"
+      "child u_child (.done(child_done), .src(src));\n"
+      "assign sink = child_done;\n"
+      "endmodule\n")
+     (goto-char (point-min))
+     (search-forward "module top")
+     (let* ((drivers (veri-kompass-within-current-module
+                      (veri-kompass-search-driver "child_done")))
+            (driver (car drivers)))
+       (should (= (length drivers) 1))
+       (should (veri-kompass-trace-candidate-p driver))
+       (should (equal (veri-kompass-trace-candidate-label driver)
+                      "u_child.done"))
+       (with-current-buffer (marker-buffer
+                             (veri-kompass-trace-candidate-marker driver))
+         (goto-char (veri-kompass-trace-candidate-marker driver))
+         (should (looking-at "done = src"))))))
+  (ert-deftest veri-kompass-test-driver-ignores-child-input-port-load ()
+    "Ensure child input connections are not treated as drivers."
+    (veri-kompass-test-with-verilog-file
+     (concat
+      "module child(input din);\n"
+      "endmodule\n"
+      "module top;\n"
+      "wire parent_sig;\n"
+      "child u_child (.din(parent_sig));\n"
+      "endmodule\n")
+     (goto-char (point-min))
+     (search-forward "module top")
+     (let ((drivers (veri-kompass-within-current-module
+                     (veri-kompass-search-driver "parent_sig"))))
+       (should (null drivers)))))
   (ert-deftest veri-kompass-test-parent-port-signal-parser ()
     "Ensure parent port parsing distinguishes same-name and renamed nets."
     (with-temp-buffer

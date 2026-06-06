@@ -68,5 +68,9 @@ Bug fixes:
 - Avoid treating child output connections such as `.out(foo)` as signal loads.
 - Follow loads from a marked child output port up to the parent signal before
   reporting a top/current module boundary.
+- Follow drivers through child output/inout port connections instead of
+  stopping at the parent instance connection line.
+- Keep symbol lookup stable around port declaration punctuation, so trailing
+  commas do not make driver/load tracing search for direction keywords.
 - Report top/current module port boundaries clearly when driver/load tracing
   cannot continue past an input/output port.

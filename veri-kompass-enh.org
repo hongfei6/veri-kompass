@@ -214,3 +214,35 @@
 - 验证结果：
   - =emacs -Q --batch -L veri-kompass -l veri-kompass/veri-kompass.el -f ert-run-tests-batch-and-exit= 通过，30/30。
   - =emacs -Q --batch -L veri-kompass -f batch-byte-compile veri-kompass/veri-kompass.el= 通过；剩余 warning 仍为既有 docstring/可选 Helm/ERT runtime warning。
+- 真实试用发现：光标位于 =src/PE_Cluster/PE/Processing_Element.v:159= 的 =PE_pad_former_address_write_fin= 上按 =C-c d= 找不到正确 driver。
+- 根因：
+  - module 起始正则没有锚定行首，会把注释里的 =module= 当成 module 声明；例如 =// PE pad module= 后接 =wire=，导致当前 module 被误识别成 =wire=。
+  - driver 搜索对 =.child_output(parent_signal)= 这类 child output 连接处理不正确，旧逻辑要么停在父层连接行，要么在方向判断后漏掉真正的 child 内部 driver。
+  - load 侧过滤 driver 位置时假设 driver candidate 都是旧式 cons，无法兼容新增的结构化 candidate。
+- 已修复：
+  - =veri-kompass-module-start-regexp= 锚定到行首 module 声明，避免注释文本污染当前 module 判断。
+  - child output/inout port connection 现在作为 driver 线索处理，并进入 child module 继续查该 output port 的内部 driver；找不到内部 driver 时退回 child output/inout port declaration。
+  - child input connection 不再被误判为 driver。
+  - 新增统一 candidate position helper，使 load 过滤兼容旧式 cons 和结构化 candidate。
+  - 结构化 candidate 的行号改为文件绝对行号，避免 narrowed buffer 内显示相对行号。
+- 新增 ERT 覆盖：
+  - =veri-kompass-test-current-module-ignores-comment-module-text=
+  - =veri-kompass-test-driver-crosses-child-output-port=
+  - =veri-kompass-test-driver-ignores-child-input-port-load=
+- 验证结果：
+  - 真实 =src/rtl.f= 中，从 =Processing_Element.v:159= 按 =C-c d= 可跳到 =src/PE_Cluster/PE/Processing_Element_core.v:269= 的 =assign former_address_write_fin = former_address_spad_write_fin=。
+  - =emacs -Q --batch -L veri-kompass -l veri-kompass/veri-kompass.el -f ert-run-tests-batch-and-exit= 通过，33/33。
+  - =emacs -Q --batch -L veri-kompass -f batch-byte-compile veri-kompass/veri-kompass.el= 通过；剩余 warning 仍为既有 docstring/可选 Helm/ERT runtime warning。
+- 真实试用发现：光标位于 =src/PE_Cluster/PE/Processing_Element_core.v= 的 output port =former_data_write_fin,= 附近按 =C-c d= 时，可能报找不到 driver。
+- 根因：
+  - 该信号本身有本地 driver：=assign former_data_write_fin = former_data_spad_write_fin=。
+  - 失败点是 =veri-kompass-sym-at-point= 在光标位于信号末尾逗号后时，会回退到行首并错误取到 =output=，导致实际搜索的是 =output= 的 driver。
+- 已修复：
+  - 新增 =veri-kompass--identifier-bounds-near-point=，优先取光标当前位置、前一字符或紧邻逗号/空白前的 Verilog identifier。
+  - =veri-kompass-sym-at-point= 使用该近邻 identifier 逻辑，避免在端口声明行误取 =input= / =output= 关键字。
+- 新增 ERT 覆盖：
+  - =veri-kompass-test-symbol-at-point-after-port-comma=
+- 验证结果：
+  - 真实 =Processing_Element_core.v= 中，光标在 =former_data_write_fin,= 逗号后执行 =C-c d= 可跳到 =src/PE_Cluster/PE/Processing_Element_core.v:270=。
+  - =emacs -Q --batch -L veri-kompass -l veri-kompass/veri-kompass.el -f ert-run-tests-batch-and-exit= 通过，34/34。
+  - =emacs -Q --batch -L veri-kompass -f batch-byte-compile veri-kompass/veri-kompass.el= 通过；剩余 warning 仍为既有 docstring/可选 Helm/ERT runtime warning。

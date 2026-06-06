@@ -230,6 +230,17 @@ BUFF-NAME is the buffer name created in case helm is used."
   (save-excursion
     (veri-kompass--port-declarations 'output sym)))
 
+(defun veri-kompass--point-on-port-declaration-p (direction sym)
+  "Return non-nil when point is on DIRECTION port declaration for SYM."
+  (let ((point-orig (point)))
+    (save-excursion
+      (cl-some (lambda (candidate)
+                 (let ((start (cdr candidate))
+                       (end (+ (cdr candidate) (length sym))))
+                   (and (<= start point-orig)
+                        (<= point-orig end))))
+               (veri-kompass--port-declarations direction sym)))))
+
 (defun veri-kompass--module-name-at-point-safe ()
   "Return current module name, or nil when point is not inside a module."
   (save-excursion
@@ -238,7 +249,7 @@ BUFF-NAME is the buffer name created in case helm is used."
 
 (defun veri-kompass--message-port-boundary (sym direction)
   "Message that SYM is a DIRECTION port boundary."
-  (message "Signal %s is a %s port of module %s; no parent/top-level boundary to continue."
+  (message "Signal %s is an %s port of module %s; no parent/top-level boundary to continue."
            sym
            direction
            (or (veri-kompass--module-name-at-point-safe) "<unknown>")))
@@ -286,7 +297,7 @@ INTERNAL if the search is limited to the current module."
 
 (defun veri-kompass--go-up-same-name-from-point (signal-name)
   "Move from current input SIGNAL-NAME to the same-name parent connection.
-Return `same' for same-name, `renamed' for renamed, or nil on failure."
+Return `same', `renamed', `no-parent', or nil."
   (if veri-kompass-curr-select
       (let* ((curr-mark (veri-kompass-curr-mark))
              (mark-mod (car curr-mark))
@@ -308,8 +319,7 @@ Return `same' for same-name, `renamed' for renamed, or nil on failure."
                 (message "Signal %s is renamed to %s at parent boundary."
                          signal-name parent-signal)
                 'renamed))))))
-    (message "Please mark current instance into hierarchy buffer.")
-    nil))
+    'no-parent))
 
 (defun veri-kompass--search-driver-at-point-rec (sym depth)
   "Search driver for SYM at point, climbing same-name inputs up to DEPTH."
@@ -322,7 +332,9 @@ Return `same' for same-name, `renamed' for renamed, or nil on failure."
          ('same
           (veri-kompass--search-driver-at-point-rec sym (1- depth)))
          ('renamed
-          nil)
+           nil)
+         ('no-parent
+          (veri-kompass--message-port-boundary sym "input"))
          (_
           (veri-kompass--message-port-boundary sym "input"))))
       ((null res)
@@ -548,18 +560,18 @@ DIRECTION should be positive to move down or negative to move up."
   "Goto the loads for symbol at point."
   (interactive)
   (veri-kompass-within-current-module
-   (let ((res (veri-kompass-search-load (car (veri-kompass-sym-at-point)))))
+   (let* ((sym (car (veri-kompass-sym-at-point)))
+          (res (unless (veri-kompass--point-on-port-declaration-p 'output sym)
+                 (veri-kompass-search-load sym))))
      (cond
       (res
        (if (equal (length res) 1)
            (goto-char (cdar res))
          (veri-kompass--show-load-selection res)))
-      ((veri-kompass--output-port-p (car (veri-kompass-sym-at-point)))
-       (veri-kompass--message-port-boundary
-        (car (veri-kompass-sym-at-point)) "output"))
+      ((veri-kompass--output-port-p sym)
+       (veri-kompass--message-port-boundary sym "output"))
       (t
-       (message "Cannot find load for %s"
-                (car (veri-kompass-sym-at-point))))))))
+       (message "Cannot find load for %s" sym))))))
 
 (defun veri-kompass-follow-from-point ()
   "Follow symbol at point.
@@ -1113,6 +1125,15 @@ The decendent parsing will start from module TOP-NAME."
   "Veri-Kompass"
   "Generate and handle verilog project hierarchy.")
 
+(defmacro veri-kompass-test-with-captured-message (&rest body)
+  "Execute BODY and return the last message string."
+  `(let ((captured-message nil))
+     (cl-letf (((symbol-function 'message)
+                (lambda (fmt &rest args)
+                  (setq captured-message (apply #'format fmt args)))))
+       ,@body
+       captured-message)))
+
 (when (featurep 'ert)
   (ert-deftest veri-kompass-test-filelist-parsing ()
     "Ensure filelists are parsed as absolute filtered paths."
@@ -1262,6 +1283,19 @@ The decendent parsing will start from module TOP-NAME."
       (should (eq (veri-kompass-search-driver "mac_en") 'go-up))
       (should (eq (veri-kompass-search-driver "psum_in") 'go-up))
       (should (eq (veri-kompass-search-driver "clk") 'go-up))))
+  (ert-deftest veri-kompass-test-driver-top-input-port-boundary-message ()
+    "Ensure top/current input port driver tracing reports a boundary."
+    (with-temp-buffer
+      (insert "module top(input clk, output out);\n")
+      (insert "assign out = clk;\n")
+      (insert "endmodule\n")
+      (goto-char (point-min))
+      (search-forward "clk")
+      (let ((msg (veri-kompass-test-with-captured-message
+                   (veri-kompass-search-driver-at-point))))
+        (should (string-match-p
+                 "Signal clk is an input port of module top"
+                 msg)))))
   (ert-deftest veri-kompass-test-driver-direct-assignment-wins ()
     "Ensure local direct drivers are preferred over input declarations."
     (with-temp-buffer
@@ -1330,6 +1364,20 @@ The decendent parsing will start from module TOP-NAME."
               (should (veri-kompass-load-select--preview-marker marker)))
             (should (= (window-point origin-window) marker))
             (kill-buffer select-buffer)))))))
+  (ert-deftest veri-kompass-test-load-top-output-port-boundary-message ()
+    "Ensure top/current output port load tracing reports a boundary."
+    (with-temp-buffer
+      (insert "module top(input clk, output out);\n")
+      (insert "assign out = clk;\n")
+      (insert "endmodule\n")
+      (goto-char (point-min))
+      (search-forward "output ")
+      (search-forward "out")
+      (let ((msg (veri-kompass-test-with-captured-message
+                   (veri-kompass-search-load-at-point))))
+        (should (string-match-p
+                 "Signal out is an output port of module top"
+                 msg)))))
   (ert-deftest veri-kompass-test-trace-selection-legacy-preview-and-commit ()
     "Ensure legacy candidates preview and commit to their source positions."
     (with-temp-buffer

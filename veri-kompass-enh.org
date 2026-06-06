@@ -129,3 +129,16 @@
   - 加载通过。
   - ERT 14/14 通过。
   - byte-compile 通过；剩余 warning 仍为既有 docstring/可选 Helm/ERT runtime warning。
+- 需求更新：跟踪 driver/load 时，如果信号已经是当前顶层的端口边界，则明确提示即可，不要继续要求 mark 或做无意义跳转。
+- 已实现：
+  - 新增端口声明通用识别，支持 =input= / =output= 方向。
+  - driver 追踪遇到无法继续上溯的 input port 时，提示该信号是当前 module 的 input port，已到 parent/top-level boundary。
+  - load 追踪在光标位于 output port 声明时，提示该信号是当前 module 的 output port，已到 parent/top-level boundary。
+  - 避免旧的 =Please mark current instance into hierarchy buffer= 在顶层端口场景中干扰用户。
+- 新增 ERT 覆盖：
+  - =veri-kompass-test-driver-top-input-port-boundary-message=
+  - =veri-kompass-test-load-top-output-port-boundary-message=
+- 验证结果：
+  - 加载通过。
+  - ERT 16/16 通过。
+  - byte-compile 通过；剩余 warning 仍为既有 docstring/可选 Helm/ERT runtime warning。

@@ -28,6 +28,16 @@ To start using veri-kompass:
 - Provide your folder directory or a Verilog filelist (for example `dut.f`)
 - Select your top module
 
+For project filelists that depend on shell environment variables or nested
+filelists, source the project setup first and generate a flattened filelist:
+
+```sh
+source path/to/project_setup.sh
+scripts/flatten_filelist.py path/to/rtl.f /tmp/rtl.flat.f --root path/to/project
+```
+
+Then give `/tmp/rtl.flat.f` to `M-x veri-kompass`.
+
 Once in the hieracky bar select modules with RET to mark and visit them
 
 In verilog sources follow signals as follow:
@@ -43,6 +53,9 @@ Features:
 
 - Accept either a project directory or a Verilog filelist, including common
   `.f` entries with include/define options and project-root-relative paths.
+- Provide `scripts/flatten_filelist.py` to expand shell environment variables,
+  recursively flatten nested filelists, and remove duplicate module basenames
+  while preserving first-seen source order.
 - Show driver/load ambiguity in a previewable trace selection buffer; use
   `C-j` / `C-k` to preview candidates and `RET` to commit the jump.
 - Continue driver tracing through same-name input port connections when a
@@ -72,5 +85,11 @@ Bug fixes:
   stopping at the parent instance connection line.
 - Keep symbol lookup stable around port declaration punctuation, so trailing
   commas do not make driver/load tracing search for direction keywords.
+- Resolve the full signal name when point is on the first, middle, or last
+  character of an identifier.
+- Ignore commented-out code when searching drivers, loads, declarations, and
+  named port connections.
+- Keep the current hierarchy selection visibly marked with a dedicated overlay,
+  instead of relying on delayed regexp fontification.
 - Report top/current module port boundaries clearly when driver/load tracing
   cannot continue past an input/output port.

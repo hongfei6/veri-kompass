@@ -133,6 +133,9 @@
 (defvar veri-kompass-curr-select nil
   "Holds the position of the current instance selected (if any).")
 
+(defvar veri-kompass-curr-select-overlay nil
+  "Overlay highlighting the current hierarchy selection.")
+
 (defvar veri-kompass-history nil
   "Holds the instance selection history.")
 
@@ -207,8 +210,10 @@ BUFF-NAME is the buffer name created in case helm is used."
         (chars "a-zA-Z0-9_$"))
     (save-excursion
       (cond
-       ((looking-at veri-kompass-ident-regex)
-        (cons (match-beginning 0) (match-end 0)))
+       ((looking-at (concat "[" chars "]"))
+        (skip-chars-backward chars line-start)
+        (when (looking-at veri-kompass-ident-regex)
+          (cons (match-beginning 0) (match-end 0))))
        ((and (> origin line-start)
              (save-excursion
                (backward-char)
@@ -243,6 +248,7 @@ BUFF-NAME is the buffer name created in case helm is used."
 (defun veri-kompass--search-direct-drivers (sym)
   "Return direct assignment drivers for SYM in the current restriction."
   (let ((res ()))
+    (veri-kompass-mark-comments)
     (goto-char (point-max))
     (while (re-search-backward
             (concat
@@ -251,8 +257,9 @@ BUFF-NAME is the buffer name created in case helm is used."
              "\\>\\)[[:space:]]*\\(\\[.*\\] +\\)?\\(=\\|<=\\)[^=].*")
             nil t)
       (let ((pos (match-beginning 0)))
-        (push (cons (veri-kompass--line-snippet) pos)
-              res)))
+        (unless (veri-kompass--comment-pos-p pos)
+          (push (cons (veri-kompass--line-snippet) pos)
+                res))))
     res))
 
 (defun veri-kompass--search-input-drivers (sym)
@@ -262,6 +269,7 @@ BUFF-NAME is the buffer name created in case helm is used."
 (defun veri-kompass--port-declarations (direction sym)
   "Return port declarations for DIRECTION and SYM in the current restriction."
   (let ((res ()))
+    (veri-kompass-mark-comments)
     (goto-char (point-min))
     (while (re-search-forward
             (concat
@@ -273,8 +281,9 @@ BUFF-NAME is the buffer name created in case helm is used."
              "\\)")
             nil t)
       (let ((pos (match-beginning 1)))
-        (push (cons (veri-kompass--line-snippet) pos)
-              res)))
+        (unless (veri-kompass--comment-pos-p pos)
+          (push (cons (veri-kompass--line-snippet) pos)
+                res))))
     (nreverse res)))
 
 (defun veri-kompass--input-port-p (sym)
@@ -339,15 +348,21 @@ BUFF-NAME is the buffer name created in case helm is used."
 
 (defun veri-kompass--parent-port-signal-at-point (port-name)
   "Return (SIGNAL . POSITION) for parent connection PORT-NAME near point."
-  (when (re-search-forward
-         (concat "\\."
-                 (regexp-quote port-name)
-                 "[[:space:]\n]*([[:space:]\n]*\\("
-                 veri-kompass-ident-regex
-                 "\\)")
-         nil t)
-    (cons (match-string-no-properties 1)
-          (match-beginning 1))))
+  (veri-kompass-mark-comments)
+  (let ((connection nil))
+    (while (and (not connection)
+                (re-search-forward
+                 (concat "\\."
+                         (regexp-quote port-name)
+                         "[[:space:]\n]*([[:space:]\n]*\\("
+                         veri-kompass-ident-regex
+                         "\\)")
+                 nil t))
+      (unless (veri-kompass--comment-pos-p (match-beginning 0))
+        (setq connection
+              (cons (match-string-no-properties 1)
+                    (match-beginning 1)))))
+    connection))
 
 (defun veri-kompass--skip-parameter-override ()
   "Skip a parameter override at point, returning non-nil if one was skipped."
@@ -359,12 +374,14 @@ BUFF-NAME is the buffer name created in case helm is used."
 (defun veri-kompass--submodule-instances-in-current-module ()
   "Return submodule instance records found in the current restriction."
   (let ((instances nil))
+    (veri-kompass-mark-comments)
     (goto-char (point-min))
     (while (re-search-forward
             (concat "\\<\\(" veri-kompass-ident-regex "\\)\\>")
             nil t)
       (let ((mod-name (match-string-no-properties 1)))
         (unless (or (char-equal (aref mod-name 0) ?\`)
+                    (veri-kompass--comment-pos-p (match-beginning 1))
                     (veri-kompass--ignored-inst-token-p mod-name))
           (save-excursion
             (skip-chars-forward " \t\n")
@@ -394,12 +411,14 @@ BUFF-NAME is the buffer name created in case helm is used."
                         "\\)\\(?:[[:space:]]*\\[[^]]+\\]\\)?"
                         "[[:space:]\n]*)")))
     (save-excursion
+      (veri-kompass-mark-comments)
       (goto-char (plist-get instance :start))
       (while (re-search-forward regexp (plist-get instance :end) t)
-        (push (list :port (match-string-no-properties 1)
-                    :signal (match-string-no-properties 2)
-                    :pos (match-beginning 2))
-              connections)))
+        (unless (veri-kompass--comment-pos-p (match-beginning 0))
+          (push (list :port (match-string-no-properties 1)
+                      :signal (match-string-no-properties 2)
+                      :pos (match-beginning 2))
+                connections))))
     (nreverse connections)))
 
 (defun veri-kompass--module-restriction (mod-name)
@@ -533,6 +552,7 @@ BUFF-NAME is the buffer name created in case helm is used."
 (defun veri-kompass--declaration-positions (sym)
   "Return declaration positions for SYM in the current restriction."
   (let ((positions nil))
+    (veri-kompass-mark-comments)
     (dolist (kind '("input" "output" "inout" "wire" "reg" "logic"))
       (goto-char (point-min))
       (while (re-search-forward
@@ -544,7 +564,8 @@ BUFF-NAME is the buffer name created in case helm is used."
                (regexp-quote sym)
                "\\)")
               nil t)
-        (push (match-beginning 1) positions)))
+        (unless (veri-kompass--comment-pos-p (match-beginning 1))
+          (push (match-beginning 1) positions))))
     positions))
 
 (defun veri-kompass--search-local-loads (sym)
@@ -563,7 +584,8 @@ BUFF-NAME is the buffer name created in case helm is used."
       (let ((pos (match-beginning 1)))
         (unless (or (member pos drivers)
                     (member pos output-connections)
-                    (member pos declarations))
+                    (member pos declarations)
+                    (veri-kompass--comment-pos-p pos))
           (push (cons (match-string 0) pos)
                 loads))))
     loads))
@@ -1218,13 +1240,24 @@ SOURCE can be a directory or a file list."
   "Return non-nil when TOKEN should not be treated as a module or instance."
   (member (downcase token) veri-kompass-ignore-keywords))
 
+(defun veri-kompass--comment-pos-p (pos)
+  "Return non-nil when POS is marked as comment text."
+  (get-text-property pos 'comment))
+
 (defun veri-kompass-mark-comments ()
   "Scanning a buffer mark all comments with property 'comment."
   (interactive)
   (save-mark-and-excursion
-    (goto-char (point-min))
-    (while (re-search-forward "//.*" nil t) ;; TODO add other comment style
-      (put-text-property (match-beginning 0) (point) 'comment t))))
+    (with-silent-modifications
+      (goto-char (point-min))
+      (while (re-search-forward "//.*" nil t)
+        (put-text-property (match-beginning 0) (point) 'comment t))
+      (goto-char (point-min))
+      (while (search-forward "/*" nil t)
+        (let ((start (match-beginning 0)))
+          (if (search-forward "*/" nil t)
+              (put-text-property start (point) 'comment t)
+            (put-text-property start (point-max) 'comment t)))))))
 
 (defsubst veri-kompass-mark-code-blocks ()
   "Mark all text within code blocks with property 'code."
@@ -1419,13 +1452,14 @@ This is the entry point function for parsing the design."
   (switch-to-buffer-other-window veri-kompass-bar-name)
   (let ((inhibit-read-only t))
     (erase-buffer)
+    (setq veri-kompass-curr-select nil)
+    (veri-kompass--clear-current-selection-overlay)
     (insert (or (veri-kompass-orgify-hier veri-kompass-hier 1) ""))
     (let ((warnings (veri-kompass-orgify-hier-warnings)))
       (when warnings
         (insert warnings))))
   (read-only-mode)
   (veri-kompass-mode)
-  (highlight-regexp "->\\|<-" 'veri-kompass-inst-marked-face)
   (whitespace-turn-off))
 
 (defun veri-kompass-open-at-point (&rest _)
@@ -1447,12 +1481,28 @@ This is the entry point function for parsing the design."
     (message "Select an instance first.")
     nil))
 
+(defun veri-kompass--clear-current-selection-overlay ()
+  "Clear the hierarchy current-selection overlay."
+  (when (overlayp veri-kompass-curr-select-overlay)
+    (delete-overlay veri-kompass-curr-select-overlay))
+  (setq veri-kompass-curr-select-overlay nil))
+
+(defun veri-kompass--highlight-current-selection-line ()
+  "Highlight the current hierarchy selection line."
+  (veri-kompass--clear-current-selection-overlay)
+  (setq veri-kompass-curr-select-overlay
+        (make-overlay (line-beginning-position) (line-end-position) nil t nil))
+  (overlay-put veri-kompass-curr-select-overlay
+               'face 'veri-kompass-inst-marked-face)
+  (overlay-put veri-kompass-curr-select-overlay 'priority 900))
+
 (defun veri-kompass-unmark ()
   "Remove mark on current instance selected."
   (interactive)
   (with-current-buffer veri-kompass-bar-name
     (save-excursion
       (when veri-kompass-curr-select
+        (veri-kompass--clear-current-selection-overlay)
         (let ((inhibit-read-only t))
           (goto-char (point-min))
           (re-search-forward " ->" nil t)
@@ -1483,6 +1533,7 @@ This is the entry point function for parsing the design."
       (insert " ->")
       (re-search-forward "$")
       (insert " <-")
+      (veri-kompass--highlight-current-selection-line)
       (backward-char 4)
       (veri-kompass-open-at-point))))
 
@@ -1802,6 +1853,49 @@ The decendent parsing will start from module TOP-NAME."
       (let ((drivers (veri-kompass-search-driver "clk")))
         (should (listp drivers))
         (should (string-match-p "assign clk = root_clk" (caar drivers))))))
+  (ert-deftest veri-kompass-test-driver-ignores-commented-code ()
+    "Ensure driver tracing ignores line and block comments."
+    (with-temp-buffer
+      (insert "module child;\n")
+      (insert "// assign foo = bad_line;\n")
+      (insert "/* assign foo = bad_block; */\n")
+      (insert "assign foo = good;\n")
+      (insert "endmodule\n")
+      (let ((drivers (veri-kompass-search-driver "foo")))
+        (should (= (length drivers) 1))
+        (should (string-match-p "assign foo = good" (caar drivers))))))
+  (ert-deftest veri-kompass-test-load-ignores-commented-code ()
+    "Ensure load tracing ignores line and block comments."
+    (with-temp-buffer
+      (insert "module child;\n")
+      (insert "assign foo = good;\n")
+      (insert "// assign bad_line = foo;\n")
+      (insert "/* assign bad_block = foo; */\n")
+      (insert "assign sink = foo;\n")
+      (insert "endmodule\n")
+      (let ((loads (veri-kompass-search-load "foo")))
+        (should (= (length loads) 1))
+        (should (string-match-p "assign sink = foo" (caar loads))))))
+  (ert-deftest veri-kompass-test-port-connections-ignore-commented-code ()
+    "Ensure commented port connections do not create trace candidates."
+    (veri-kompass-test-with-verilog-file
+     (concat
+      "module child(output out, input din);\n"
+      "assign out = din;\n"
+      "endmodule\n"
+      "module top(input din);\n"
+      "wire foo;\n"
+      "// child u_bad (.out(foo), .din(din));\n"
+      "child u_good (.out(foo), .din(din));\n"
+      "endmodule\n")
+     (goto-char (point-min))
+     (search-forward "module top")
+     (let ((drivers (veri-kompass-within-current-module
+                     (veri-kompass-search-driver "foo"))))
+       (should (= (length drivers) 1))
+       (should (string-match-p
+                "u_good.out"
+                (veri-kompass-trace-candidate-label (car drivers)))))))
   (ert-deftest veri-kompass-test-symbol-at-point-after-port-comma ()
     "Ensure symbol lookup near a port comma does not return direction keywords."
     (with-temp-buffer
@@ -1815,6 +1909,18 @@ The decendent parsing will start from module TOP-NAME."
                      "former_data_write_fin"))
       (veri-kompass-search-driver-at-point)
       (should (looking-at "former_data_write_fin = done"))))
+  (ert-deftest veri-kompass-test-symbol-at-point-inside-identifier ()
+    "Ensure symbol lookup returns the full identifier from common cursor spots."
+    (with-temp-buffer
+      (insert "module child;\n")
+      (insert "assign out = long_signal_name;\n")
+      (insert "endmodule\n")
+      (dolist (offset '(0 5 15 16))
+        (goto-char (point-min))
+        (search-forward "long_signal_name")
+        (backward-char (- 16 offset))
+        (should (equal (car (veri-kompass-sym-at-point))
+                       "long_signal_name")))))
   (ert-deftest veri-kompass-test-driver-candidate-keeps-source-position ()
     "Ensure snippet formatting does not clobber driver match positions."
     (with-temp-buffer
@@ -1952,14 +2058,45 @@ The decendent parsing will start from module TOP-NAME."
                (list (cons "assign foo = bar;" first)
                      (cons "assign foo = baz;" second))
                "Select driver line")
-              (should (overlayp veri-kompass-trace-highlight-overlay))
-              (should (= (overlay-start veri-kompass-trace-highlight-overlay)
-                         first))
-              (select-window (get-buffer-window veri-kompass-load-select-buffer-name))
-              (with-current-buffer veri-kompass-load-select-buffer-name
-                (veri-kompass-load-select-next))
-              (should (= (overlay-start veri-kompass-trace-highlight-overlay)
-                         second)))))))
+               (should (overlayp veri-kompass-trace-highlight-overlay))
+               (should (= (overlay-start veri-kompass-trace-highlight-overlay)
+                          first))
+               (select-window (get-buffer-window veri-kompass-load-select-buffer-name))
+               (with-current-buffer veri-kompass-load-select-buffer-name
+                 (veri-kompass-load-select-next))
+               (should (= (overlay-start veri-kompass-trace-highlight-overlay)
+                          second))))))))
+  (ert-deftest veri-kompass-test-hierarchy-mark-uses-overlay ()
+    "Ensure current hierarchy selection is visibly highlighted by an overlay."
+    (let ((veri-kompass-curr-select nil)
+          (veri-kompass-curr-select-overlay nil)
+          (veri-kompass-history nil)
+          (bar (get-buffer-create veri-kompass-bar-name)))
+      (unwind-protect
+          (save-window-excursion
+            (with-current-buffer bar
+              (let ((inhibit-read-only t))
+                (erase-buffer)
+                (insert "* [[file::1][u_child]] [[file::1][child]]\n"))
+              (veri-kompass-mode)
+              (goto-char (point-min))
+              (search-forward "u_child")
+              (cl-letf (((symbol-function 'veri-kompass-open-at-point)
+                         (lambda (&rest _) (current-buffer))))
+                (veri-kompass-mark-and-jump))
+              (should (overlayp veri-kompass-curr-select-overlay))
+              (should (equal (overlay-get veri-kompass-curr-select-overlay 'face)
+                             'veri-kompass-inst-marked-face))
+              (should (string-match-p
+                       "->.*u_child.*<-"
+                       (buffer-substring-no-properties
+                        (line-beginning-position) (line-end-position))))
+              (veri-kompass-unmark)
+              (should-not (overlayp veri-kompass-curr-select-overlay))
+              (should-not (string-match-p "->\\|<-"
+                                          (buffer-string)))))
+        (when (buffer-live-p bar)
+          (kill-buffer bar)))))
   (ert-deftest veri-kompass-test-load-select-preview ()
     "Ensure moving across load entries previews the source location."
     (with-temp-buffer
@@ -2273,7 +2410,6 @@ The decendent parsing will start from module TOP-NAME."
       (kill-buffer dead-buffer)
       (veri-kompass-highlight-trace-target marker)
       (should (null veri-kompass-trace-highlight-overlay))))
-  )
 
 (provide 'veri-kompass)
 

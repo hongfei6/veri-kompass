@@ -246,3 +246,61 @@
   - 真实 =Processing_Element_core.v= 中，光标在 =former_data_write_fin,= 逗号后执行 =C-c d= 可跳到 =src/PE_Cluster/PE/Processing_Element_core.v:270=。
   - =emacs -Q --batch -L veri-kompass -l veri-kompass/veri-kompass.el -f ert-run-tests-batch-and-exit= 通过，34/34。
   - =emacs -Q --batch -L veri-kompass -f batch-byte-compile veri-kompass/veri-kompass.el= 通过；剩余 warning 仍为既有 docstring/可选 Helm/ERT runtime warning。
+*** 2026-06-13
+- 需求更新：=C-c d= / =C-c l= 时光标可能位于信号名首字符、中间、最后一个字符，或信号末尾标点后，符号提取都应稳定得到完整信号名。
+- 根因：
+  - =veri-kompass--identifier-bounds-near-point= 原先在光标位于 identifier 内部时直接从当前位置向后匹配，因此会把 =long_signal_name= 误取成 =signal_name=、=e= 等后缀。
+- 已修复：
+  - 当光标位于 identifier 字符上时，先向左扩展到 token 起点，再按 =veri-kompass-ident-regex= 取完整 identifier。
+  - 保留光标在信号后一位、逗号、空白等位置时回退到前一 token 的逻辑。
+- 新增 ERT 覆盖：
+  - =veri-kompass-test-symbol-at-point-inside-identifier=，覆盖首字符、中间、末字符、末尾标点后四种位置。
+- 验证结果：
+  - =emacs -Q --batch -L veri-kompass -l veri-kompass/veri-kompass.el -f ert-run-tests-batch-and-exit= 通过，35/35。
+  - =emacs -Q --batch -L veri-kompass -f batch-byte-compile veri-kompass/veri-kompass.el= 通过；剩余 warning 仍为既有 docstring/可选 Helm/ERT runtime warning。
+- 真实试用发现：追踪 driver/load 时会匹配到已注释掉的代码。
+- 根因：
+  - hierarchy 构建路径已有部分 comment 标记，但 driver/load 搜索、port declaration 搜索、named port connection 搜索没有统一跳过注释。
+  - 旧 =veri-kompass-mark-comments= 只处理 =//= 行注释，未处理 =/* ... */= 块注释。
+- 已修复：
+  - 新增 =veri-kompass--comment-pos-p=，统一判断候选位置是否属于注释。
+  - 扩展 =veri-kompass-mark-comments=，同时标记 =//= 行注释和 =/* ... */= 块注释，使用 =with-silent-modifications= 避免污染 buffer 修改状态。
+  - direct driver、port declaration、local load、submodule instance、named port connection、parent port connection 搜索都会跳过注释命中。
+- 新增 ERT 覆盖：
+  - =veri-kompass-test-driver-ignores-commented-code=
+  - =veri-kompass-test-load-ignores-commented-code=
+  - =veri-kompass-test-port-connections-ignore-commented-code=
+- 验证结果：
+  - =emacs -Q --batch -L veri-kompass -l veri-kompass/veri-kompass.el -f ert-run-tests-batch-and-exit= 通过，38/38。
+  - =emacs -Q --batch -L veri-kompass -f batch-byte-compile veri-kompass/veri-kompass.el= 通过；剩余 warning 仍为既有 docstring/可选 Helm/ERT runtime warning。
+- 真实试用发现：RTL hierarchy 中用于指示当前文件所处 module/instance 的红色标记不稳定或消失。
+- 根因：
+  - 旧实现只在创建 hierarchy buffer 时调用一次 =highlight-regexp= 高亮 =->= / =<-=。
+  - 当前 instance 标记是在后续 =veri-kompass-mark-and-jump= 中插入的，显示依赖 font-lock 后续刷新，容易被模式切换或未重刷状态影响。
+- 已修复：
+  - 新增 =veri-kompass-curr-select-overlay=，mark 当前 hierarchy 行时直接创建 overlay 并使用 =veri-kompass-inst-marked-face=。
+  - =veri-kompass-unmark= 同时清理 overlay 和原有 =->= / =<-= 文本标记，保留现有 =veri-kompass-curr-mark= 解析逻辑。
+  - 重建 hierarchy buffer 时清理旧 selection 状态，避免 stale overlay 残留。
+  - 修正测试区一个括号闭合问题，避免后续 ERT 定义被错误嵌入前一个测试 body。
+- 新增 ERT 覆盖：
+  - =veri-kompass-test-hierarchy-mark-uses-overlay=，验证 mark 后 overlay 存在、face 正确，unmark 后 overlay 和箭头都被清理。
+- 验证结果：
+  - =emacs -Q --batch -L veri-kompass -l veri-kompass/veri-kompass.el -f ert-run-tests-batch-and-exit= 通过，40/40。
+  - =emacs -Q --batch -L veri-kompass -f batch-byte-compile veri-kompass/veri-kompass.el= 通过；剩余 warning 仍为既有 docstring/可选 Helm/ERT runtime warning。
+- 新增辅助脚本：=scripts/flatten_filelist.py=。
+- 目标：
+  - 支持已有 RTL filelist 中直接使用 shell 环境变量的场景；用户先 =source= 工程环境，脚本继承当前进程环境并展开 =$VAR= / =${VAR}=。
+  - 递归展开嵌套 filelist，输出一个 veri-kompass 可直接读取的新 filelist。
+  - 按 filelist 原顺序处理源文件，同名模块只保留第一次出现；当前实现按源文件 basename 推断模块名，符合“文件名通常等于模块名”的假设。
+- 支持形式：
+  - 嵌套 filelist：=-f xxx=、=-fxxx=、=-F xxx=、=-file xxx=、=--filelist xxx=，以及裸 =.f= / =.flist= / =.list= 条目。
+  - 源文件默认保留 =.v= / =.sv=，可用 =--extensions v,sv,vh= 调整。
+  - 相对路径先按当前 filelist 所在目录解析，再按 =--root= 指定工程根目录解析；输出统一为绝对路径。
+- 使用示例：
+  - =source path/to/project_setup.sh=
+  - =scripts/flatten_filelist.py path/to/rtl.f /tmp/rtl.flat.f --root path/to/project=
+  - 在 =M-x veri-kompass= 中选择 =/tmp/rtl.flat.f=。
+- 验证结果：
+  - =python3 -m py_compile scripts/flatten_filelist.py= 通过。
+  - =python3 scripts/flatten_filelist.py src/rtl.f /tmp/veri-kompass-flat-rtl.f --root src= 输出 58 个源文件。
+  - 临时 fixture 覆盖环境变量展开、=-f= / =-Fxxx= / =-file=xxx= / =--filelist=xxx= 嵌套、裸 =.f= 嵌套、重复 basename 去重；设置 =VK_ROOT=/tmp/vkfl= 时按顺序输出 =A.v=、=B.sv=、=D.v=、=E.v=、=F.sv=、=C.v= 六个文件，未设置环境变量时按预期报错。
